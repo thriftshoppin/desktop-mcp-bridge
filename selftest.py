@@ -82,12 +82,22 @@ def make_store() -> str:
         sys.exit(2)
     d = tempfile.mkdtemp(prefix="bridge-approval-")
     policy.Approval(ROOT, d).approve()
+    import psutil
+    from desktop_bridge import clients as clients_mod
+    me = psutil.Process(os.getpid())
+    clients_mod.AllowList(d).add(clients_mod.identity_key(me.exe(), os.path.abspath(sys.argv[0])), "selftest", me.exe())
     return d
 
 
+MAIN_INST = f"st-{UID}"
+
+
 @contextlib.asynccontextmanager
-async def open_session(env: dict | None = None):
-    params = StdioServerParameters(command=sys.executable, args=[os.path.join(ROOT, "launcher.py")], cwd=ROOT, env=env or {})
+async def open_session(env: dict | None = None, inst: str | None = None):
+    """One MCP client through the real launcher. Each test group uses its own guardian instance name (own control pipe, mutex, state folder),
+    and the guardian exits 6 s after its last client leaves, so the user's real shared guardian is never touched."""
+    e = {**(env or {}), "DESKTOP_BRIDGE_INSTANCE": inst or MAIN_INST, "DESKTOP_BRIDGE_IDLE_EXIT_S": "6"}
+    params = StdioServerParameters(command=sys.executable, args=[os.path.join(ROOT, "launcher.py")], cwd=ROOT, env=e)
     async with stdio_client(params) as (r, w):
         async with ClientSession(r, w) as s:
             await s.initialize()
@@ -576,20 +586,28 @@ async def t_esc(c: Client):
     out = os.path.join(TMP, f"helper-{UID}")
     pid, w = await launch_form(c, "button", 1250, 500)
     await c.call("desktop_screenshot")
+    # --- T30: stage 1 cancels the running call (bridge stays usable); a second Esc 2.5 s later stops the bridge
     at = time.time() + 3.5
-    run_helper("esc", at, out + "1.json")
+    run_helper("esc", at, out + "1.json", count=2, gap=2500)
     task = asyncio.create_task(c.call("desktop_wait", seconds=30))
     res = await asyncio.wait_for(task, 25)
     t_ret = time.time()
+    st1 = await c.call("desktop_session_status")        # right after press 1 (press 2 comes 2.5 s later)
+    still = await c.call("desktop_monitors_list")
     info = await helper_result(out + "1.json")
     halt = (t_ret - info["t_down"][0]) * 1000
-    st = await c.call("desktop_session_status")
+    record("T30 Esc stage 1: the running wait is CANCELLED (CANCELLED_BY_USER), the bridge stays usable, border yellow, 'press Esc again' state",
+           err_code(res) == "CANCELLED_BY_USER" and halt < 150 and not st1["kill_switch"]["active"] and st1["kill_switch"]["esc"]["stage"] == 1 and still.get("ok") and st1["overlay"]["state"] == "cancelled",
+           f"halted {halt:.0f} ms after the Esc (injected by an elevated helper process, not by the bridge or the user's keyboard); kill active={st1['kill_switch']['active']}; esc stage={st1['kill_switch']['esc']['stage']}; border={st1['overlay']['state']}; next call ok={still.get('ok')}")
+    await asyncio.sleep(0.4)
+    st2 = await c.call("desktop_session_status")
     nxt = await c.call("desktop_monitors_list")
-    border_red = st["overlay"]["state"] == "stopped" and st["overlay"]["visible"]
     r_ = await c.call("desktop_resume")
-    record("T30 Esc (a user press, from another process) halts a running wait; border red; all calls refused until resume",
-           err_code(res) == "KILL_SWITCH" and halt < 150 and st["kill_switch"]["source"] == "esc" and err_code(nxt) == "KILL_SWITCH" and border_red and r_.get("ok"),
-           f"halted {halt:.0f} ms after the Esc (injected by an elevated helper process, not by the bridge); source={st['kill_switch']['source']!r}; border state={st['overlay']['state']} visible={st['overlay']['visible']}; next call -> {err_code(nxt)}")
+    record("T30b Esc stage 2: a second Esc within the window STOPS the bridge for every call; border red; refused until resume",
+           st2["kill_switch"]["active"] and st2["kill_switch"]["source"] == "esc" and err_code(nxt) == "KILL_SWITCH" and st2["overlay"]["state"] == "stopped" and r_.get("ok"),
+           f"after the second Esc: kill active={st2['kill_switch']['active']} source={st2['kill_switch']['source']!r}; border={st2['overlay']['state']}; next call -> {err_code(nxt)}; resume ok={r_.get('ok')}")
+    await asyncio.sleep(11)   # let the second-press window (10 s) expire so the next Esc is a stage-1 again
+    # --- T31: Esc halts a mouse glide mid-way (stage 1)
     f = await c.call("desktop_find", query="TargetButton", window=w["hwnd"], role="Button")
     node = f["matches"][0]
     cx, cy = node["rect"][0] + node["rect"][2] // 2, node["rect"][1] + node["rect"][3] // 2
@@ -604,11 +622,12 @@ async def t_esc(c: Client):
     halt = (t_ret - info["t_down"][0]) * 1000
     cur = cursor()
     mid = abs(cur[0] - start[0]) + abs(cur[1] - start[1]) > 80 and abs(cur[0] - cx) + abs(cur[1] - cy) > 80
-    await c.call("desktop_resume")
     hit = await wait_window(c, "clicks=1", 1.5)
-    record("T31 Esc halts a mouse glide mid-way (no click happens)", err_code(res) == "KILL_SWITCH" and halt < 150 and mid and not hit,
+    record("T31 Esc cancels a mouse glide mid-way (no click happens)", err_code(res) == "CANCELLED_BY_USER" and halt < 150 and mid and not hit,
            f"halted {halt:.0f} ms after the Esc; cursor stopped at {cur} (start {start}, target ({cx},{cy})) mid-way={mid}; click happened={bool(hit)}")
     await kill_pid(c, pid)
+    await asyncio.sleep(11)
+    # --- T32: Esc cancels typing mid-string
     pid, w = await launch_form(c, "password", 300, 450)
     f = await c.call("desktop_find", query="PlainBox", window=w["hwnd"], role="Edit")
     ref = f["matches"][0]["ref"]
@@ -619,14 +638,28 @@ async def t_esc(c: Client):
     t_ret = time.time()
     info = await helper_result(out + "3.json")
     halt = (t_ret - info["t_down"][0]) * 1000
-    await c.call("desktop_resume")
     v = (await c.call("desktop_find", query="PlainBox", window=w["hwnd"], role="Edit"))["matches"][0].get("value", "")
-    record("T32 Esc halts typing mid-string (stop flag checked per character)", err_code(res) == "KILL_SWITCH" and halt < 150 and 20 < len(v) < 300, f"halted {halt:.0f} ms after the Esc; {len(v)} of 300 characters had been typed")
+    record("T32 Esc cancels typing mid-string (stop flag checked per character)", err_code(res) == "CANCELLED_BY_USER" and halt < 150 and 20 < len(v) < 300, f"halted {halt:.0f} ms after the Esc; {len(v)} of 300 characters had been typed")
+    await asyncio.sleep(11)
+    # --- T33: the bridge's own injected Esc must not cancel or stop anything
     await c.call("desktop_window_focus", hwnd=w["hwnd"])
     k = await c.call("desktop_key", combo="esc")
     await asyncio.sleep(0.3)
     st = await c.call("desktop_session_status")
-    record("T33 the bridge's own injected Esc (desktop_key esc) does NOT trip the kill switch", k.get("ok") and not st["kill_switch"]["active"], f"key ok={k.get('ok')}; kill active={st['kill_switch']['active']}; esc armed={st['kill_switch']['esc']}")
+    record("T33 the bridge's own injected Esc (desktop_key esc) does NOT cancel or stop anything", k.get("ok") and not st["kill_switch"]["active"] and st["kill_switch"]["esc"]["stage"] == 0,
+           f"key ok={k.get('ok')}; kill active={st['kill_switch']['active']}; esc stage={st['kill_switch']['esc']['stage']}")
+    # --- T34b: Esc while in control with NOTHING running stops the bridge at once
+    await c.call("desktop_monitors_list")                     # arms 'in control' (8 s grace)
+    at = time.time() + 3.0
+    run_helper("esc", at, out + "4.json")
+    await helper_result(out + "4.json")
+    await asyncio.sleep(0.4)
+    st = await c.call("desktop_session_status")
+    nxt = await c.call("desktop_monitors_list")
+    await c.call("desktop_resume")
+    record("T34b Esc while Claude is in control but nothing is running stops the bridge immediately", st["kill_switch"]["active"] and st["kill_switch"]["source"] == "esc" and err_code(nxt) == "KILL_SWITCH",
+           f"kill active={st['kill_switch']['active']} source={st['kill_switch']['source']!r}; next call -> {err_code(nxt)}")
+    # --- T34: Esc while idle (outside the control window) does nothing
     for _ in range(40):
         st = await c.call("desktop_session_status")
         if not st["in_control"]:
@@ -754,31 +787,105 @@ async def t_visibility(c: Client):
 
 # ============================================================================= separate sessions
 
+def feed_window_count() -> int:
+    import psutil  # noqa
+    n = 0
+    PROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def cb(h, _):
+        nonlocal n
+        L = u32.GetWindowTextLengthW(h)
+        buf = ctypes.create_unicode_buffer(L + 1)
+        u32.GetWindowTextW(h, buf, L + 1)
+        if FEED.lower() in buf.value.lower() and u32.IsWindowVisible(h):
+            n += 1
+        return True
+
+    u32.EnumWindows(PROC(cb), 0)
+    return n
+
+
+def ctl_pipe(inst: str) -> str:
+    return f"desktop-bridge-ctl-{inst}-{os.environ.get('USERNAME', 'user').lower()}"
+
+
+def pipes_present(prefix: str) -> list[str]:
+    return [p for p in os.listdir("\\\\.\\pipe\\") if p.startswith(prefix)]
+
+
 async def t_launcher_kill(env):
-    name = "T15 launcher killed mid-run: worker exits, pipe gone, no orphan"
-    pipes_before = {p for p in os.listdir("\\\\.\\pipe\\") if p.startswith("desktop-bridge-")}
-    py_before = sum(1 for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "python.exe")
-    pr = subprocess.Popen([sys.executable, os.path.join(ROOT, "launcher.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, env={**os.environ, **env})
+    """The guardian is SHARED now: killing one client's launcher ends only that client's session; the guardian stays up for the others and exits on its own after being idle."""
+    inst = f"st-lk-{UID}"
+    base_feeds = feed_window_count()
+    pr = subprocess.Popen([sys.executable, os.path.join(ROOT, "launcher.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
+                          env={**os.environ, **env, "DESKTOP_BRIDGE_INSTANCE": inst, "DESKTOP_BRIDGE_IDLE_EXIT_S": "6"})
     init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "selftest", "version": "1"}}})
     pr.stdin.write((init + "\n").encode())
     pr.stdin.flush()
     line = pr.stdout.readline()
     ok_init = b'"result"' in line
-    during = {p for p in os.listdir("\\\\.\\pipe\\") if p.startswith("desktop-bridge-")} - pipes_before
+    ctl_up = ctl_pipe(inst) in pipes_present("desktop-bridge-ctl-")
+    sess_pipes = [p for p in pipes_present("desktop-bridge-") if "-ctl-" not in p]
     subprocess.run(["taskkill", "/PID", str(pr.pid), "/F", "/T"], capture_output=True)
+    await asyncio.sleep(1.5)
+    ctl_still = ctl_pipe(inst) in pipes_present("desktop-bridge-ctl-")
+    feeds_during = feed_window_count()
     gone = False
-    for _ in range(40):
-        time.sleep(0.25)
-        if not ({p for p in os.listdir("\\\\.\\pipe\\") if p.startswith("desktop-bridge-")} & during):
+    for _ in range(60):
+        await asyncio.sleep(0.5)
+        if ctl_pipe(inst) not in pipes_present("desktop-bridge-ctl-"):
             gone = True
             break
-    time.sleep(1.0)
-    py_after = sum(1 for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "python.exe")
-    record(name, bool(ok_init and during and gone and py_after <= py_before), f"initialize via second launcher ok={ok_init}; pipes appeared={len(during)} vanished={gone}; python.exe count {py_before} -> {py_after}")
+    record("T15 shared guardian lifecycle: a client's launcher is killed -> only its session ends; the guardian stays up, then exits by itself when idle (6 s); no extra feed window",
+           bool(ok_init and ctl_up and sess_pipes and ctl_still and gone and feeds_during == base_feeds + 1),
+           f"initialize via launcher ok={ok_init}; control pipe up={ctl_up}; session pipes={len(sess_pipes)}; control pipe still there 1.5 s after the kill={ctl_still}; guardian exited when idle={gone}; feed windows {base_feeds} -> {feeds_during} (one for the guardian)")
+
+
+async def s_shared(env):
+    """Two clients at the same time, ONE guardian: one feed window, per-client state, per-client names in status."""
+    inst = f"st-sh-{UID}"
+    base_feeds = feed_window_count()
+    async with open_session(env, inst) as a:
+        async with open_session(env, inst) as b:
+            sa = await a.call("desktop_session_status")
+            sb = await b.call("desktop_session_status")
+            feeds = feed_window_count()
+            shot = await a.call("desktop_screenshot", monitor=1)
+            nob = await b.call("desktop_click", x=10, y=10)            # b never took a screenshot: its own 'last screenshot' must be empty
+            ok_b = await b.call("desktop_windows_list")
+            record("T70 SHARED bridge: two clients, one guardian: one feed window, both listed, per-client screenshot reference, both calls work at the same time",
+                   feeds == base_feeds + 1 and len(sa["clients"]) == 2 and sa["clients"] == sb["clients"] and sa["instance"] == inst and shot.get("ok") and err_code(nob) == "NO_SCREENSHOT" and ok_b.get("ok"),
+                   f"feed windows {base_feeds} -> {feeds}; clients={sa['clients']}; instance={sa['instance']}; a took a screenshot; b's click without its own screenshot -> {err_code(nob)}; b windows_list ok={ok_b.get('ok')}")
+            # input is serialized across clients: a long action of a and a quick one of b both finish, nothing interleaves
+            t0 = time.time()
+            ra, rb = await asyncio.gather(a.call("desktop_wait", seconds=1.5), b.call("desktop_monitors_list"))
+            record("T71 two clients calling at once both complete", ra.get("ok") and rb.get("ok"), f"a.wait ok={ra.get('ok')} b.monitors_list ok={rb.get('ok')} in {time.time() - t0:.1f} s")
+
+
+async def s_unknown_client(env):
+    """A client the user has never allowed: the guardian asks in the feed window and serves nothing until the user types y (a test cannot answer it)."""
+    import tempfile as _tf
+    inst = f"st-uk-{UID}"
+    empty = _tf.mkdtemp(prefix="bridge-state-empty-")
+    from desktop_bridge import policy as _p
+    _p.Approval(ROOT, empty).approve()                     # config approved, but NO client allowed
+    pr = subprocess.Popen([sys.executable, os.path.join(ROOT, "launcher.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
+                          env={**os.environ, "DESKTOP_BRIDGE_INSTANCE": inst, "DESKTOP_BRIDGE_IDLE_EXIT_S": "6", "DESKTOP_BRIDGE_APPROVAL_DIR": empty})
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "selftest", "version": "1"}}})
+    pr.stdin.write((init + "\n").encode())
+    pr.stdin.flush()
+    await asyncio.sleep(9)
+    answered = pr.poll() is not None
+    feed = feed_log_text()
+    prompted = "to use the bridge? (y/N)" in feed
+    subprocess.run(["taskkill", "/PID", str(pr.pid), "/F", "/T"], capture_output=True)
+    _recycle_dir(empty)
+    record("T72 an UNKNOWN client is not served: the guardian asks the user in the feed window ('Allow client ... (y/N)') and nothing is answered until then",
+           prompted and not answered, f"prompt printed in the feed={prompted}; launcher got no session (still waiting)={not answered}")
 
 
 async def s_overlay_fail(env):
-    async with open_session({**env, "DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL": "1"}) as c:
+    async with open_session({**env, "DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL": "1"}, f"st-ovf-{UID}") as c:
         s = await c.call("desktop_session_status")
         refused = {}
         for tool, args in [("desktop_click", {"x": 10, "y": 10, "coords": "screen"}), ("desktop_type", {"text": "x"}), ("desktop_key", {"combo": "f13"}),
@@ -804,7 +911,7 @@ def _recycle_dir(path: str) -> None:
 
 async def s_approval_pending():
     empty = tempfile.mkdtemp(prefix="bridge-approval-empty-")
-    async with open_session({"DESKTOP_BRIDGE_APPROVAL_DIR": empty}) as c:
+    async with open_session({"DESKTOP_BRIDGE_APPROVAL_DIR": empty}, f"st-apr-{UID}") as c:
         s = await c.call("desktop_session_status")
         r = await c.call("desktop_monitors_list")
         f = await c.call("desktop_fs", op="stat", path="C:\\Windows")
@@ -818,7 +925,7 @@ async def s_approval_pending():
 
 async def s_injection(env):
     since = time.strftime("%Y-%m-%d %H:%M:%S")
-    async with open_session(env) as c:
+    async with open_session(env, f"st-inj-{UID}") as c:
         pw, ww = await launch_form(c, "inject-weak", 700, 300, auto_close=40)
         weak = await c.call("desktop_ui_tree", window=ww["hwnd"] if ww else None, depth=3)
         s1 = await c.call("desktop_session_status")
@@ -892,7 +999,7 @@ async def main() -> int:
                 await t_log(c, since)
     if part in ("all", "sessions") and not only:
         await t_launcher_kill(env)
-        for fn in (lambda: s_overlay_fail(env), lambda: s_approval_pending(), lambda: s_injection(env)):
+        for fn in (lambda: s_shared(env), lambda: s_unknown_client(env), lambda: s_overlay_fail(env), lambda: s_approval_pending(), lambda: s_injection(env)):
             try:
                 await fn()
             except Exception as e:

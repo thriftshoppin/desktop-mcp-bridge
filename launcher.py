@@ -86,23 +86,40 @@ def start_guardian():
 
 
 def try_open_control():
+    """-> an open pipe, None if no guardian is running, or False if it is running but momentarily busy (retry; never start a second guardian)."""
     try:
         return open(control_path(), "r+b", buffering=0)
-    except (FileNotFoundError, PermissionError, OSError):
+    except FileNotFoundError:
         return None
+    except OSError as e:
+        if getattr(e, "winerror", 0) == 231 or e.errno == 22:  # ERROR_PIPE_BUSY: the guardian is between two pipe instances
+            return False
+        return None
+
+
+def open_existing(deadline: float):
+    """Open the control pipe of a RUNNING guardian, waiting out 'busy'. Returns the pipe, or None if no guardian is running."""
+    while True:
+        f = try_open_control()
+        if f is False:
+            if time.monotonic() > deadline:
+                raise RuntimeError("the guardian's control pipe stayed busy")
+            time.sleep(0.05)
+            continue
+        return f
 
 
 def open_control(timeout: float = 60.0):
     """Open the guardian's control pipe; start the guardian once if needed. A start lock keeps two launchers from starting two guardians."""
     deadline = time.monotonic() + timeout
-    f = try_open_control()
+    f = open_existing(deadline)
     if f:
         return f
     lock = k32.CreateMutexW(None, False, f"Local\\DesktopBridgeStart-{INSTANCE}")
     got = False
     try:
         got = k32.WaitForSingleObject(lock, 45000) in (0, 0x80)  # WAIT_OBJECT_0 / WAIT_ABANDONED
-        f = try_open_control()  # another launcher may have started it while we waited for the lock
+        f = open_existing(deadline)  # another launcher may have started it while we waited for the lock
         if f:
             return f
         start_guardian()
@@ -110,7 +127,7 @@ def open_control(timeout: float = 60.0):
             f = try_open_control()
             if f:
                 return f
-            time.sleep(0.2)
+            time.sleep(0.2 if f is None else 0.05)
         raise RuntimeError("the guardian did not come up (control pipe never appeared); see its window or %TEMP%\\desktop-bridge\\worker-<pid>.log")
     finally:
         if got:
