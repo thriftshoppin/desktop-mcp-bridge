@@ -61,6 +61,7 @@ ap.add_argument("--hold", type=int, default=40)
 ap.add_argument("--count", type=int, default=1)
 ap.add_argument("--gap", type=int, default=300)
 ap.add_argument("--title", default="")
+ap.add_argument("--vk", type=int, default=0)
 ap.add_argument("--x", type=int, default=0)
 ap.add_argument("--y", type=int, default=0)
 a = ap.parse_args()
@@ -88,6 +89,10 @@ elif a.action == "close_window":
 
     user32.EnumWindows(PROC2(cb2), 0)
     res["closed"] = [h for h in found if user32.PostMessageW(h, 0x10, 0, 0)]  # WM_CLOSE, like the user clicking the X
+elif a.action == "hold_key":
+    key(a.vk, False)
+    time.sleep(a.hold / 1000)
+    key(a.vk, True)
 elif a.action == "move_mouse":
     user32.SetCursorPos(a.x, a.y)
     res["cursor"] = [a.x, a.y]

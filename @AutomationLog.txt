@@ -1,1 +1,0 @@
-2026-10-30 14:16:08.208 <stdin>[4] <module> -> Find Control Timeout(10s): {ClassName: 'Notepad', ControlType: WindowControl}

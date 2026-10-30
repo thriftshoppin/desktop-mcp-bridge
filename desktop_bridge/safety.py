@@ -15,10 +15,11 @@ from typing import Callable
 class ToolRefused(Exception):
     """Raised by a tool to return a clean {ok:false,error:{code,message}} to the client."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, data: dict | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data or {}
 
 
 # ----------------------------------------------------------------------------- action log

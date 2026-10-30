@@ -384,9 +384,22 @@ def press_combo(vks: list[int], hold_ms: int = 20, check: Callable[[], None] | N
             key_event(v, True)
 
 
-def type_text(text: str, delay_ms: float = 2.0, check: Callable[[], None] | None = None) -> int:
+def user_keys_down(own: tuple[int, ...] = ()) -> list[int]:
+    """Virtual keys / mouse buttons currently held down by the user (or anything else), excluding `own` and media/volume/browser keys."""
+    out = []
+    for vk in (0x01, 0x02, 0x04, 0x05, 0x06) + tuple(range(0x08, 0xFF)):
+        if vk in own or 0xA6 <= vk <= 0xB7 or vk == 0xE7:
+            continue
+        if user32.GetAsyncKeyState(vk) & 0x8000:
+            out.append(vk)
+    return out
+
+
+def type_text(text: str, delay_ms: float = 2.0, check: Callable[[], None] | None = None, progress: dict | None = None) -> int:
     n = 0
     for ch in text:
+        if progress is not None:
+            progress["n"] = n
         if check:
             check()
         if ch == "\n":
@@ -401,6 +414,8 @@ def type_text(text: str, delay_ms: float = 2.0, check: Callable[[], None] | None
                 up = _INPUT(type=1); up.ki = _KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
                 _send([down, up])
         n += 1
+        if progress is not None:
+            progress["n"] = n
         if delay_ms:
             time.sleep(delay_ms / 1000)
     return n

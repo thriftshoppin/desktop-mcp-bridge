@@ -51,7 +51,8 @@
     "glide_ms_min": 120,
     "glide_ms_max": 300,
     "type_ms_per_char": 8,
-    "value_method_min_chars": 200
+    "value_method_min_chars": 200,
+    "yield_wait_s": 6
   },
   "overlay": {
     "color": "#FF8C00",

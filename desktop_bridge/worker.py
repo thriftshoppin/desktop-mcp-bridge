@@ -221,7 +221,7 @@ def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", 
                 result = out
         except ToolRefused as e:
             status = f"REFUSED {e.code}"
-            result = {"ok": False, "error": {"code": e.code, "message": e.message}}
+            result = {"ok": False, "error": {"code": e.code, "message": e.message, **({"data": e.data} if e.data else {})}}
         except Exception as e:  # noqa
             status = f"ERROR {type(e).__name__}"
             result = {"ok": False, "error": {"code": "INTERNAL", "message": f"{type(e).__name__}: {str(e)[:300]}"}}

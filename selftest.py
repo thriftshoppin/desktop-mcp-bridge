@@ -654,7 +654,7 @@ async def t_self_protect(c: Client):
 
 
 async def t_yield(c: Client):
-    """Shared environment: when the USER closes a window, switches focus or moves the mouse, the bridge stops instead of fighting."""
+    """Shared environment: the bridge watches what the USER does and only stops when it actually affects the action."""
     out = os.path.join(TMP, f"helper-yield-{UID}")
     text = "0123456789" * 30
 
@@ -672,13 +672,22 @@ async def t_yield(c: Client):
 
     pid, w, res, ms, info = await typing_case("close", "close_window", title="BridgeTest password")
     st = await c.call("desktop_session_status")
-    record("T36 the user CLOSES the target window mid-typing: typing stops, TARGET_CLOSED, nothing further sent, no kill lockout",
-           err_code(res) == "TARGET_CLOSED" and ms < 200 and not st["kill_switch"]["active"], f"-> {err_code(res)} {ms:.0f} ms after the window was closed (helper posted WM_CLOSE: {info.get('closed')}); kill active={st['kill_switch']['active']}")
+    d = (res.get("error") or {}).get("data", {})
+    record("T36 the user CLOSES the target window mid-typing: typing stops (TARGET_CLOSED), the error says what was typed, no kill lockout",
+           err_code(res) == "TARGET_CLOSED" and ms < 200 and not st["kill_switch"]["active"] and d.get("target_alive") is False and 0 < d.get("typed", 0) < 300,
+           f"-> {err_code(res)} {ms:.0f} ms after the close (WM_CLOSE posted: {bool(info.get('closed'))}); data: target_alive={d.get('target_alive')} typed={d.get('typed')} remaining={d.get('remaining')} foreground_now={d.get('foreground_now')}; kill active={st['kill_switch']['active']}")
     await kill_pid(c, pid)
     pid, w, res, ms, info = await typing_case("focus", "focus_feed")
-    record("T37 the user SWITCHES focus mid-typing: typing stops (FOCUS_CHANGED) and the bridge does not steal focus back", err_code(res) == "FOCUS_CHANGED" and ms < 200,
-           f"-> {err_code(res)} {ms:.0f} ms after the switch (foreground is the feed: {info.get('foreground_is_feed')})")
+    d = (res.get("error") or {}).get("data", {})
+    record("T37 the user SWITCHES to another app mid-typing: typing stops (FOCUS_CHANGED), focus is NOT stolen back, the error names the app that has focus",
+           err_code(res) == "FOCUS_CHANGED" and ms < 200 and d.get("target_alive") is True and "Desktop Bridge" in str(d.get("foreground_now")) and 0 < d.get("typed", 0) < 300,
+           f"-> {err_code(res)} {ms:.0f} ms after the switch; data: foreground_now={d.get('foreground_now')} typed={d.get('typed')} remaining={d.get('remaining')}")
     await c.call("desktop_window_focus", hwnd=w["hwnd"])
+    await kill_pid(c, pid)
+    pid, w, res, ms, info = await typing_case("keys", "hold_key", vk=0x87, hold=700)
+    d = (res.get("error") or {}).get("data", {})
+    record("T39 the user presses keys in the same window while the bridge types: typing stops (USER_INTERVENTION), not a kill", err_code(res) == "USER_INTERVENTION" and 0x87 in d.get("user_keys_down", []) and 0 < d.get("typed", 0) < 300,
+           f"-> {err_code(res)}; held keys seen={d.get('user_keys_down')}; typed={d.get('typed')} remaining={d.get('remaining')}")
     await kill_pid(c, pid)
     pid, w = await launch_form(c, "button", 1250, 500)
     f = await c.call("desktop_find", query="TargetButton", window=w["hwnd"], role="Button")
@@ -687,12 +696,14 @@ async def t_yield(c: Client):
     at = time.time() + 3.5
     run_helper("move_mouse", at, f"{out}-mouse.json", x=900, y=900)
     await sleep_until(at - 0.10)
+    t0 = time.time()
     res = await c.call("desktop_click", ref=node["ref"])
+    took = time.time() - t0
     await helper_result(f"{out}-mouse.json")
     await asyncio.sleep(0.4)
     hit = await wait_window(c, "clicks=1", 1.5)
-    record("T38 the user MOVES THE MOUSE during a glide: the bridge yields (USER_INTERVENTION) and does not click", err_code(res) == "USER_INTERVENTION" and not hit,
-           f"-> {err_code(res)}; click happened={bool(hit)}")
+    record("T38 the user BUMPS THE MOUSE during a glide: the bridge waits until the mouse is still, glides again and then clicks the right target", bool(res.get("ok") and hit and took > 0.5),
+           f"click ok={res.get('ok')} after {took:.1f} s (includes waiting for the mouse to settle); target clicked={bool(hit)}")
     await kill_pid(c, pid)
 
 

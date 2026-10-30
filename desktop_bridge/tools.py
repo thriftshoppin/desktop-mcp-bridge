@@ -410,25 +410,72 @@ class Bridge:
         hw = winapi.user32.WindowFromPoint(wt.POINT(px, py))
         return int(winapi.user32.GetAncestor(hw, 2)) if hw else 0  # GA_ROOT
 
-    def _guard(self, root: int, focus: bool):
+    def _fg_info(self) -> dict:
+        fg = winapi.foreground_hwnd()
+        return {"title": winapi.window_text(fg)[:80], "process": winapi.process_info(winapi.window_pid(fg))[0]} if fg else {"title": None, "process": None}
+
+    def _guard(self, root: int, focus: bool, progress: dict | None = None, total: int = 0):
         """Per-step check during glides, key presses and typing: the kill switch, and the target window must still exist (the user may close it).
         With focus=True it must also keep the keyboard focus (same process counts), otherwise the keys would land in whatever the user switched to."""
         pid = winapi.window_pid(root) if root else 0
+
+        def info() -> dict:
+            d = {"target_alive": bool(root and winapi.user32.IsWindow(root)), "foreground_now": self._fg_info()}
+            if progress is not None:
+                d.update(typed=progress.get("n", 0), remaining=max(0, total - progress.get("n", 0)))
+            return d
 
         def check() -> None:
             self.ks.check()
             if not root:
                 return
             if not winapi.user32.IsWindow(root):
-                self.say("target window was closed: action stopped", "yel")
-                raise ToolRefused("TARGET_CLOSED", "Stopped: the window being operated on was closed (by the user or by the app). Nothing further was sent.")
+                self.say("the target window was closed: action stopped (nothing else is touched)", "yel")
+                raise ToolRefused("TARGET_CLOSED", "Stopped: the window being operated on was closed (by the user or by the app). Nothing further was sent. "
+                                  "The error data says what was done and what is left; decide with the user whether to continue elsewhere.", info())
             if focus:
                 fg = winapi.foreground_hwnd()
                 if fg and fg != root and winapi.window_pid(fg) != pid:
-                    self.say("focus moved to another app: typing stopped", "yel")
-                    raise ToolRefused("FOCUS_CHANGED", "Stopped: keyboard focus moved away from the target window (the user switched windows?). Nothing further was typed.")
+                    d = info()
+                    self.say(f"focus moved to {d['foreground_now']['process']} ('{d['foreground_now']['title']}'): typing stopped, not stealing it back", "yel")
+                    raise ToolRefused("FOCUS_CHANGED", "Stopped: keyboard focus moved away from the target window (the user switched windows, e.g. to another app). "
+                                      "Nothing further was typed and focus was NOT taken back. The error data shows the app that has focus now and how much was typed; "
+                                      "if it is just the user doing something else, ask or wait, then continue with the remaining text.", d)
+                keys = winapi.user_keys_down((0x0D, 0x09))
+                if keys:
+                    time.sleep(0.05)
+                    self.ks.check()  # a user Esc (or the kill hotkeys) is handled by the kill switch, not as an intervention
+                    keys = winapi.user_keys_down((0x0D, 0x09))
+                    if keys:
+                        d = info()
+                        d["user_keys_down"] = keys
+                        self.say("you are using the keyboard/mouse in the target window: typing paused/stopped (shared environment)", "yel")
+                        raise ToolRefused("USER_INTERVENTION", "Stopped: the user is pressing keys or mouse buttons while the bridge types into the same window, so the text would interleave. "
+                                          "Nothing further was typed. See error data for what was typed.", d)
 
         return check
+
+    def _glide_patiently(self, px: int, py: int, cc: dict, guard) -> float:
+        """Glide to the target. If the user grabs the mouse, wait (up to control.yield_wait_s) until it has been still for 0.5 s, then glide again from where it is."""
+        wait_max = float(cc.get("yield_wait_s", 6))
+        for attempt in range(4):
+            try:
+                return winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), guard)
+            except winapi.UserMoved:
+                self.say("you moved the mouse: waiting for you to finish, then continuing", "yel")
+                end = time.monotonic() + wait_max
+                still_since, last = time.monotonic(), winapi.cursor_pos()
+                while time.monotonic() < end:
+                    guard()
+                    time.sleep(0.05)
+                    cur = winapi.cursor_pos()
+                    if abs(cur[0] - last[0]) > 2 or abs(cur[1] - last[1]) > 2 or winapi.user_keys_down((0x1B,)):
+                        last, still_since = cur, time.monotonic()
+                    elif time.monotonic() - still_since >= 0.5:
+                        break
+                else:
+                    raise ToolRefused("USER_INTERVENTION", "Stopped: the user kept using the mouse for " + str(round(wait_max)) + " s. Nothing was clicked. Ask the user before retrying.")
+        raise ToolRefused("USER_INTERVENTION", "Stopped: the user kept moving the mouse. Nothing was clicked.")
 
     def _pointer_click(self, px: int, py: int, button: str = "left", count: int = 1, modifiers: list[str] | None = None) -> dict:
         """The real mouse: eased glide to the point, halo on the overlay, then a real click. Never an invoke pattern."""
@@ -451,11 +498,7 @@ class Bridge:
         self.ks.check()
         cc = self.cfg.get("control", {})
         guard = self._guard(root, focus=False)
-        try:
-            ms = winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), guard)
-        except winapi.UserMoved as e:
-            self.say("you moved the mouse: action stopped (shared environment: the bridge yields)", "yel")
-            raise ToolRefused("USER_INTERVENTION", f"Stopped: the user moved the mouse during the action ({e}). Nothing was clicked. Ask the user before retrying.")
+        ms = self._glide_patiently(px, py, cc, guard)
         if self.overlay is not None:
             self.overlay.halo(px, py)
         time.sleep(0.03)
@@ -531,7 +574,8 @@ class Bridge:
         else:
             target = winapi.foreground_hwnd()
         # shared environment: if focus is somewhere else the user (or another app) took it; do NOT steal it back, stop (the guard below says why)
-        guard = self._guard(target, focus=True)
+        prog = {"n": 0}
+        guard = self._guard(target, focus=True, progress=prog, total=n)
         if method == "value":
             self.say(f"type method=value: ValuePattern.SetValue of {n} chars into {rec.target} (opt-in, long text)", "yel")
             vp = c.GetValuePattern()
@@ -544,7 +588,7 @@ class Bridge:
             winapi.press_combo(winapi.parse_combo("delete"), check=guard)
         per = float(cc.get("type_ms_per_char", 8))
         t0 = time.perf_counter()
-        winapi.type_text(text, delay_ms=per, check=guard)
+        winapi.type_text(text, delay_ms=per, check=guard, progress=prog)
         el = (time.perf_counter() - t0) * 1000
         return {"ok": True, "typed": n, "method": "keystrokes", "ms_per_char": round(el / max(n, 1), 1)}
 
