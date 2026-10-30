@@ -169,9 +169,12 @@ class Bridge:
             on_console = set(buf[:n]) if n <= 64 else set()
             byp = winapi.windows_by_pid()
             out = []
+            helper = getattr(getattr(self.log, "_ps", None), "pid", None)
             for c in psutil.Process().children(recursive=True):
-                wins = [w for w in byp.get(c.pid, []) if w["class"] not in IGNORED_WINDOW_CLASSES]
-                out.append({"pid": c.pid, "name": c.name(), "on_feed_console": c.pid in on_console,
+                if c.name().lower() == "conhost.exe":  # console host of an app Claude launched (it draws that app's visible console)
+                    continue
+                wins = [w for w in byp.get(c.pid, []) if w["class"] not in IGNORED_WINDOW_CLASSES and not w["class"].startswith(".NET-BroadcastEventWindow")]
+                out.append({"pid": c.pid, "name": c.name(), "role": "bridge-helper" if c.pid == helper else "launched-app", "on_feed_console": c.pid in on_console,
                             "visible_windows": sum(1 for w in wins if w["visible"]), "hidden_windows": [w["class"] for w in wins if not w["visible"]]})
             return out
         except Exception as e:
@@ -402,6 +405,31 @@ class Bridge:
             raise ToolRefused("NO_RECT", f"Element '{ref}' has no on-screen rectangle (offscreen or hidden).")
         return (r[0] + r[2] // 2, r[1] + r[3] // 2, c)
 
+    def _root_at(self, px: int, py: int) -> int:
+        import ctypes.wintypes as wt
+        hw = winapi.user32.WindowFromPoint(wt.POINT(px, py))
+        return int(winapi.user32.GetAncestor(hw, 2)) if hw else 0  # GA_ROOT
+
+    def _guard(self, root: int, focus: bool):
+        """Per-step check during glides, key presses and typing: the kill switch, and the target window must still exist (the user may close it).
+        With focus=True it must also keep the keyboard focus (same process counts), otherwise the keys would land in whatever the user switched to."""
+        pid = winapi.window_pid(root) if root else 0
+
+        def check() -> None:
+            self.ks.check()
+            if not root:
+                return
+            if not winapi.user32.IsWindow(root):
+                self.say("target window was closed: action stopped", "yel")
+                raise ToolRefused("TARGET_CLOSED", "Stopped: the window being operated on was closed (by the user or by the app). Nothing further was sent.")
+            if focus:
+                fg = winapi.foreground_hwnd()
+                if fg and fg != root and winapi.window_pid(fg) != pid:
+                    self.say("focus moved to another app: typing stopped", "yel")
+                    raise ToolRefused("FOCUS_CHANGED", "Stopped: keyboard focus moved away from the target window (the user switched windows?). Nothing further was typed.")
+
+        return check
+
     def _pointer_click(self, px: int, py: int, button: str = "left", count: int = 1, modifiers: list[str] | None = None) -> dict:
         """The real mouse: eased glide to the point, halo on the overlay, then a real click. Never an invoke pattern."""
         import ctypes.wintypes as wt
@@ -422,16 +450,25 @@ class Bridge:
             mod_vks.append(winapi.VK[mname.lower()])
         self.ks.check()
         cc = self.cfg.get("control", {})
-        ms = winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), self.ks.check)
+        guard = self._guard(root, focus=False)
+        try:
+            ms = winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), guard)
+        except winapi.UserMoved as e:
+            self.say("you moved the mouse: action stopped (shared environment: the bridge yields)", "yel")
+            raise ToolRefused("USER_INTERVENTION", f"Stopped: the user moved the mouse during the action ({e}). Nothing was clicked. Ask the user before retrying.")
         if self.overlay is not None:
             self.overlay.halo(px, py)
         time.sleep(0.03)
+        cur = winapi.cursor_pos()
+        if abs(cur[0] - px) > 6 or abs(cur[1] - py) > 6:
+            self.say("you moved the mouse: click cancelled", "yel")
+            raise ToolRefused("USER_INTERVENTION", "Stopped: the user moved the mouse right before the click. Nothing was clicked. Ask the user before retrying.")
         held = []
         try:
             for v in mod_vks:
                 winapi.key_event(v, False)
                 held.append(v)
-            winapi.mouse_click(button, count, check=self.ks.check)
+            winapi.mouse_click(button, count, check=guard)
         finally:
             for v in reversed(held):
                 winapi.key_event(v, True)
@@ -490,6 +527,11 @@ class Bridge:
         if c is not None:
             self._pointer_click(px, py)  # visible click to focus the target
             time.sleep(0.08)
+            target = self._root_at(px, py)
+        else:
+            target = winapi.foreground_hwnd()
+        # shared environment: if focus is somewhere else the user (or another app) took it; do NOT steal it back, stop (the guard below says why)
+        guard = self._guard(target, focus=True)
         if method == "value":
             self.say(f"type method=value: ValuePattern.SetValue of {n} chars into {rec.target} (opt-in, long text)", "yel")
             vp = c.GetValuePattern()
@@ -498,11 +540,11 @@ class Bridge:
             vp.SetValue(text)
             return {"ok": True, "typed": n, "method": "ValuePattern.SetValue (announced in the feed)"}
         if clear:
-            winapi.press_combo(winapi.parse_combo("ctrl+a"), check=self.ks.check)
-            winapi.press_combo(winapi.parse_combo("delete"), check=self.ks.check)
+            winapi.press_combo(winapi.parse_combo("ctrl+a"), check=guard)
+            winapi.press_combo(winapi.parse_combo("delete"), check=guard)
         per = float(cc.get("type_ms_per_char", 8))
         t0 = time.perf_counter()
-        winapi.type_text(text, delay_ms=per, check=self.ks.check)
+        winapi.type_text(text, delay_ms=per, check=guard)
         el = (time.perf_counter() - t0) * 1000
         return {"ok": True, "typed": n, "method": "keystrokes", "ms_per_char": round(el / max(n, 1), 1)}
 
@@ -515,9 +557,10 @@ class Bridge:
         rec.target = f"fg '{winapi.window_text(fg)[:40]}'" if fg else "no foreground"
         self._check_not_self(fg)
         self._check_input_target()
+        kguard = self._guard(fg, focus=False)
         for _ in range(max(1, min(int(repeat), 50))):
-            self.ks.check()
-            winapi.press_combo(vks, check=self.ks.check)
+            kguard()
+            winapi.press_combo(vks, check=kguard)
             time.sleep(0.03)
         return {"ok": True, "pressed": combo, "repeat": repeat}
 

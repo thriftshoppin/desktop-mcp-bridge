@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import capture  # noqa: F401  (first on purpose)
 from . import config as config_mod
 from . import control as control_mod
+from . import mcp_patch
 from . import policy, safety, tools, winapi
 from .overlay import Overlay
 from .safety import KillSwitch, LogWriter, ToolRefused
@@ -403,6 +404,7 @@ def main() -> None:
     ap.add_argument("--force-overlay-fail", action="store_true", help="test hook: make overlay creation fail (can only make the bridge MORE restrictive)")
     ap.add_argument("--handoff", action="store_true", help="read pipe/token/pid from the per-user handoff file (scheduled-task start)")
     args = ap.parse_args()
+    mcp_patch.apply()
     cfg = config_mod.load()
     feed = Feed(cfg)
     winapi.set_dpi_aware()

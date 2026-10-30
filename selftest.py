@@ -42,9 +42,10 @@ UID = uuid.uuid4().hex[:8]
 u32 = ctypes.WinDLL("user32", use_last_error=True)
 
 
-def record(name: str, ok: bool, detail: str = "") -> None:
+def record(name: str, ok, detail: str = "") -> None:
+    """ok: True = PASS, False = FAIL, None = SKIP (not run on purpose; counted separately)."""
     RESULTS.append((name, ok, detail))
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}  {detail}", flush=True)
+    print(f"  {'PASS' if ok else 'SKIP' if ok is None else 'FAIL'}  {name}  {detail}", flush=True)
 
 
 class Client:
@@ -248,6 +249,9 @@ async def t_coords(c: Client):
 
 async def t_notepad(c: Client):
     name = "T06 Notepad round trip (launch, visible click+typing, ui_tree shows text, ctrl+s, fs read matches, close tab)"
+    if any((p.info["name"] or "").lower() == "notepad.exe" for p in psutil.process_iter(["name"])):
+        record(name, None, "SKIPPED: Notepad is already running (the user's own tabs would be at risk). Close Notepad and run `selftest.py core` to include this check.")
+        return
     os.makedirs(TMP, exist_ok=True)
     path = os.path.join(TMP, f"selftest-notepad-{UID}.txt")
     text = "bridge selftest \u00fcn\u00ef \u2713 123"
@@ -258,6 +262,10 @@ async def t_notepad(c: Client):
         record(name, False, "Notepad window with our file did not appear")
         return
     await c.call("desktop_window_focus", hwnd=w["hwnd"])
+    now = await wait_window(c, f"selftest-notepad-{UID}", 3)
+    if not now or f"selftest-notepad-{UID}" not in now["title"] or not now.get("focused"):
+        record(name, False, f"our tab is not the active, focused one (title={now['title'] if now else None!r}); NOT typing, to protect the user's tabs")
+        return
     f = await c.call("desktop_find", query="", window=w["hwnd"], role="Document", limit=3)
     if not f.get("matches"):
         f = await c.call("desktop_find", query="", window=w["hwnd"], role="Edit", limit=3)
@@ -287,7 +295,7 @@ async def t_elevated_input(c: Client):
     name = "T07 input into an ELEVATED window (Task Manager)"
     pre = await c.call("desktop_windows_list")
     if any(w["process"].lower() == "taskmgr.exe" for w in pre.get("windows", [])):
-        record(name, False, "SKIPPED: Task Manager was already open (not touching the user's window)")
+        record(name, None, "SKIPPED: Task Manager was already open (not touching the user's window)")
         return
     await c.call("desktop_launch", app="taskmgr.exe", wait_ms=4000)
     w = await wait_window(c, "Task Manager", 10)
@@ -645,6 +653,49 @@ async def t_self_protect(c: Client):
         await kill_pid(c, pid)
 
 
+async def t_yield(c: Client):
+    """Shared environment: when the USER closes a window, switches focus or moves the mouse, the bridge stops instead of fighting."""
+    out = os.path.join(TMP, f"helper-yield-{UID}")
+    text = "0123456789" * 30
+
+    async def typing_case(tag, action, **kw):
+        pid, w = await launch_form(c, "password", 300, 450)
+        f = await c.call("desktop_find", query="PlainBox", window=w["hwnd"], role="Edit")
+        ref = f["matches"][0]["ref"]
+        at = time.time() + 4.0
+        run_helper(action, at, f"{out}-{tag}.json", **kw)
+        await sleep_until(at - 1.5)
+        res = await c.call("desktop_type", text=text, ref=ref)
+        t_ret = time.time()
+        info = await helper_result(f"{out}-{tag}.json")
+        return pid, w, res, (t_ret - info["t_start"]) * 1000, info
+
+    pid, w, res, ms, info = await typing_case("close", "close_window", title="BridgeTest password")
+    st = await c.call("desktop_session_status")
+    record("T36 the user CLOSES the target window mid-typing: typing stops, TARGET_CLOSED, nothing further sent, no kill lockout",
+           err_code(res) == "TARGET_CLOSED" and ms < 200 and not st["kill_switch"]["active"], f"-> {err_code(res)} {ms:.0f} ms after the window was closed (helper posted WM_CLOSE: {info.get('closed')}); kill active={st['kill_switch']['active']}")
+    await kill_pid(c, pid)
+    pid, w, res, ms, info = await typing_case("focus", "focus_feed")
+    record("T37 the user SWITCHES focus mid-typing: typing stops (FOCUS_CHANGED) and the bridge does not steal focus back", err_code(res) == "FOCUS_CHANGED" and ms < 200,
+           f"-> {err_code(res)} {ms:.0f} ms after the switch (foreground is the feed: {info.get('foreground_is_feed')})")
+    await c.call("desktop_window_focus", hwnd=w["hwnd"])
+    await kill_pid(c, pid)
+    pid, w = await launch_form(c, "button", 1250, 500)
+    f = await c.call("desktop_find", query="TargetButton", window=w["hwnd"], role="Button")
+    node = f["matches"][0]
+    ctypes.windll.user32.SetCursorPos(-3000, -1000)
+    at = time.time() + 3.5
+    run_helper("move_mouse", at, f"{out}-mouse.json", x=900, y=900)
+    await sleep_until(at - 0.10)
+    res = await c.call("desktop_click", ref=node["ref"])
+    await helper_result(f"{out}-mouse.json")
+    await asyncio.sleep(0.4)
+    hit = await wait_window(c, "clicks=1", 1.5)
+    record("T38 the user MOVES THE MOUSE during a glide: the bridge yields (USER_INTERVENTION) and does not click", err_code(res) == "USER_INTERVENTION" and not hit,
+           f"-> {err_code(res)}; click happened={bool(hit)}")
+    await kill_pid(c, pid)
+
+
 # ============================================================================= M0.1: visibility policy
 
 async def t_visibility(c: Client):
@@ -677,9 +728,10 @@ async def t_visibility(c: Client):
            f"new windows={[(x['title'][:28], x['state'], x['restored_from_minimized']) for x in r.get('new_windows', [])]}")
     s = await c.call("desktop_session_status")
     ch = s["children"]
-    bad = [x for x in ch if x.get("name", "").lower().startswith("pythonw") or (not x.get("on_feed_console") and not x.get("visible_windows")) or x.get("hidden_windows")]
-    record("T45 no hidden helper processes: every child of the worker shares the visible feed console or owns a visible window; no pythonw", not bad and "error" not in str(ch)[:80],
-           f"children={[(x.get('name'), 'console' if x.get('on_feed_console') else 'own-window' if x.get('visible_windows') else 'HIDDEN?') for x in ch]}; offenders={bad}")
+    bad = [x for x in ch if x.get("name", "").lower().startswith("pythonw") or x.get("hidden_windows")
+           or (x.get("role") == "bridge-helper" and not x.get("on_feed_console")) or (x.get("role") == "launched-app" and not x.get("on_feed_console") and not x.get("visible_windows"))]
+    record("T45 no hidden helper processes: the bridge's own helper shares the visible feed console; every app Claude launched shows a visible window; no pythonw, no hidden windows", not bad and "error" not in str(ch)[:80],
+           f"children={[(x.get('name'), x.get('role'), 'console' if x.get('on_feed_console') else 'own-window' if x.get('visible_windows') else 'HIDDEN?') for x in ch]}; offenders={bad}")
 
 
 # ============================================================================= separate sessions
@@ -797,7 +849,7 @@ async def main() -> int:
                   lambda c, tools: t_clipboard(c), lambda c, tools: t_password(c), lambda c, tools: t_kill_combos(c), lambda c, tools: t_fs(c),
                   lambda c, tools: t_run_ui(c), lambda c, tools: t_audio(c), lambda c, tools: t_perf(c)]
     steps_control = [lambda c, tools: t_border(c), lambda c, tools: t_clickthrough(c), lambda c, tools: t_mouse(c), lambda c, tools: t_typing(c),
-                     lambda c, tools: t_esc(c), lambda c, tools: t_self_protect(c), lambda c, tools: t_visibility(c)]
+                     lambda c, tools: t_esc(c), lambda c, tools: t_self_protect(c), lambda c, tools: t_yield(c), lambda c, tools: t_visibility(c)]
     steps = (steps_core if part in ("all", "core") else []) + (steps_control if part in ("all", "control") else [])
     if steps:
         async with open_session(env) as c:
@@ -820,12 +872,15 @@ async def main() -> int:
             except Exception as e:
                 record("EXCEPTION in session test", False, f"{type(e).__name__}: {e}")
     _recycle_dir(store)
-    passed = sum(1 for _, ok, _ in RESULTS if ok)
-    print(f"\n{passed}/{len(RESULTS)} PASS")
-    for n, ok, d in RESULTS:
-        if not ok:
-            print("  FAILED:", n, "-", d)
-    return 0 if passed == len(RESULTS) else 1
+    passed = sum(1 for _, ok, _ in RESULTS if ok is True)
+    failed = [r for r in RESULTS if r[1] is False]
+    skipped = [r for r in RESULTS if r[1] is None]
+    print(f"\n{passed}/{passed + len(failed)} PASS ({len(skipped)} skipped on purpose)")
+    for n, ok, d in failed:
+        print("  FAILED:", n, "-", d)
+    for n, ok, d in skipped:
+        print("  SKIPPED:", n, "-", d)
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":

@@ -60,6 +60,9 @@ ap.add_argument("--out", default="")
 ap.add_argument("--hold", type=int, default=40)
 ap.add_argument("--count", type=int, default=1)
 ap.add_argument("--gap", type=int, default=300)
+ap.add_argument("--title", default="")
+ap.add_argument("--x", type=int, default=0)
+ap.add_argument("--y", type=int, default=0)
 a = ap.parse_args()
 while time.time() < a.at:
     time.sleep(0.001)
@@ -71,6 +74,23 @@ if a.action == "esc":
         time.sleep(a.hold / 1000)
         key(0x1B, True)
         time.sleep(a.gap / 1000)
+elif a.action == "close_window":
+    found = []
+    PROC2 = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def cb2(h, _):
+        n = user32.GetWindowTextLengthW(h)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(h, buf, n + 1)
+        if a.title.lower() in buf.value.lower() and user32.IsWindowVisible(h):
+            found.append(int(h))
+        return True
+
+    user32.EnumWindows(PROC2(cb2), 0)
+    res["closed"] = [h for h in found if user32.PostMessageW(h, 0x10, 0, 0)]  # WM_CLOSE, like the user clicking the X
+elif a.action == "move_mouse":
+    user32.SetCursorPos(a.x, a.y)
+    res["cursor"] = [a.x, a.y]
 elif a.action in ("focus_feed", "minimize_feed"):
     h = feed_hwnd()
     res["hwnd"] = h

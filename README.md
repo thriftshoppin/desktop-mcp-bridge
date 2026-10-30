@@ -139,3 +139,6 @@ icacls "C:\Users\SysAdmin\tools\claude-desktop-bridge\SECURITY.md" /inheritance:
 To edit later: `icacls <path> /grant "Administrators:(F)"` (then re-run the lock). A real boundary needs a separate account that owns these files.
 
 **Test hooks (can only make the bridge stricter or test a different approval store):** `DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL=1` (worker `--force-overlay-fail`) and `DESKTOP_BRIDGE_APPROVAL_DIR` (worker `--approval-dir`). Neither relaxes the injection gate or any policy.
+**Shared environment (yield, never fight).** Every step of a glide, key press and typed character checks the kill switch and that the target window still exists (`TARGET_CLOSED` if you closed it); typing also needs the keyboard focus to stay
+with the target (`FOCUS_CHANGED` if you switched windows; the bridge does not steal focus back); a glide stops if you move the mouse, and a click is cancelled if the cursor is not where the bridge put it (`USER_INTERVENTION`). Closing the feed window stops the worker and the session.
+**mcp SDK quirk fixed:** `desktop_bridge/mcp_patch.py` stops the SDK from JSON-parsing string arguments such as `{}` or `[1,2]` (it would have broken writing JSON files with `fs`, `type`, `clipboard_set`).

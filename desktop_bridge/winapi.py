@@ -424,20 +424,29 @@ def move_cursor(x: int, y: int) -> None:
     user32.SetCursorPos(int(x), int(y))
 
 
+class UserMoved(Exception):
+    """The real cursor is not where the bridge put it: the user is using the mouse. Yield."""
+
+
 def glide(x: int, y: int, ms_min: int = 120, ms_max: int = 300, check: Callable[[], None] | None = None) -> float:
     """Move the REAL cursor to (x, y) with an eased glide (smoothstep), 120-300 ms scaled by distance. Returns duration in ms."""
     sx, sy = cursor_pos()
     dist = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
     dur = min(ms_max, ms_min + dist * 0.12) / 1000.0
     t0 = time.perf_counter()
+    last = (sx, sy)
     while True:
         if check:
             check()
+        cur = cursor_pos()
+        if abs(cur[0] - last[0]) > 6 or abs(cur[1] - last[1]) > 6:
+            raise UserMoved(f"cursor at {cur}, expected near {last}")
         f = (time.perf_counter() - t0) / dur
         if f >= 1.0:
             break
         e = f * f * (3 - 2 * f)
-        move_cursor(round(sx + (x - sx) * e), round(sy + (y - sy) * e))
+        last = (round(sx + (x - sx) * e), round(sy + (y - sy) * e))
+        move_cursor(*last)
         time.sleep(0.008)
     move_cursor(x, y)
     return dur * 1000
