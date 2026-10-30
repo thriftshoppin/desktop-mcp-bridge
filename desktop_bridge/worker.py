@@ -474,6 +474,12 @@ def _create_ctl_pipe(name: str, first: bool):
                                      255, 65536, 65536, 0, _make_sd())
 
 
+def require_visible_console(root_fn, visible_fn) -> bool:
+    """No headless mode: the guardian runs only when its feed window exists and is visible."""
+    h = root_fn()
+    return bool(h) and bool(visible_fn(h))
+
+
 def control_pipe_name(instance: str) -> str:
     return f"desktop-bridge-ctl-{instance}-{os.environ.get('USERNAME', 'user').lower()}"
 
@@ -493,6 +499,9 @@ def main() -> None:
     cfg = config_mod.load()
     feed = Feed(cfg)
     winapi.set_dpi_aware()
+    if not require_visible_console(tools.console_root, winapi.user32.IsWindowVisible):
+        sys.stderr.write("Desktop Bridge guardian: refusing to run without a visible feed window (no headless mode).\n")
+        os._exit(4)
     instance = args.instance
 
     import win32api
@@ -658,9 +667,12 @@ def main() -> None:
             feed.put(f"client disconnected: {label}; {hub.session_count()} client(s) left", "dim")
             log.log(f"client disconnected: {label} clients_now={hub.session_count()}")
 
+    pending = [0]
+
     def handle_control(h) -> None:
         import win32file
         import win32pipe
+        pending[0] += 1
         try:
             pid = win32pipe.GetNamedPipeClientProcessId(h)
             raw = win32file.ReadFile(h, 4096)[1]
@@ -692,6 +704,7 @@ def main() -> None:
             except Exception:
                 pass
         finally:
+            pending[0] -= 1
             try:
                 win32file.FlushFileBuffers(h)
                 win32pipe.DisconnectNamedPipe(h)
@@ -728,7 +741,7 @@ def main() -> None:
         last = time.monotonic()
         while True:
             time.sleep(1)
-            if hub.session_count() > 0 or not approved_evt.is_set():
+            if hub.session_count() > 0 or pending[0] > 0 or not approved_evt.is_set():
                 last = time.monotonic()
             elif idle_s > 0 and time.monotonic() - last > idle_s:
                 shutdown(f"idle: no client for {idle_s:g} s")

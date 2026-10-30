@@ -805,6 +805,13 @@ def feed_window_count() -> int:
     return n
 
 
+async def wait_no_test_guardians(timeout: float = 30.0) -> None:
+    """Other test guardians exit 6 s after their last client; wait for them so a feed-window count baseline is not polluted."""
+    end = time.time() + timeout
+    while time.time() < end and [p for p in pipes_present("desktop-bridge-ctl-st-")]:
+        await asyncio.sleep(0.5)
+
+
 def ctl_pipe(inst: str) -> str:
     return f"desktop-bridge-ctl-{inst}-{os.environ.get('USERNAME', 'user').lower()}"
 
@@ -816,6 +823,7 @@ def pipes_present(prefix: str) -> list[str]:
 async def t_launcher_kill(env):
     """The guardian is SHARED now: killing one client's launcher ends only that client's session; the guardian stays up for the others and exits on its own after being idle."""
     inst = f"st-lk-{UID}"
+    await wait_no_test_guardians()
     base_feeds = feed_window_count()
     pr = subprocess.Popen([sys.executable, os.path.join(ROOT, "launcher.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
                           env={**os.environ, **env, "DESKTOP_BRIDGE_INSTANCE": inst, "DESKTOP_BRIDGE_IDLE_EXIT_S": "6"})
@@ -844,6 +852,7 @@ async def t_launcher_kill(env):
 async def s_shared(env):
     """Two clients at the same time, ONE guardian: one feed window, per-client state, per-client names in status."""
     inst = f"st-sh-{UID}"
+    await wait_no_test_guardians()
     base_feeds = feed_window_count()
     async with open_session(env, inst) as a:
         async with open_session(env, inst) as b:
