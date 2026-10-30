@@ -146,6 +146,16 @@ class ClientIdentity(unittest.TestCase):
             self.assertFalse(al.remove(k))
 
 
+class LauncherDetection(unittest.TestCase):
+    def test_only_the_script_being_run_counts(self):
+        self.assertTrue(clients.is_launcher_cmd(["python.exe", "C:/x/launcher.py"]))
+        self.assertTrue(clients.is_launcher_cmd([r"C:\v\python.exe", r"C:\x\LAUNCHER.PY"]))
+        # a different script that merely receives launcher.py as an argument is a CLIENT, not the launcher chain
+        self.assertFalse(clients.is_launcher_cmd(["python.exe", "probe_client.py", "C:/x/launcher.py", "{}"]))
+        self.assertFalse(clients.is_launcher_cmd(["claude.exe", "--mcp", "launcher.py"]))
+        self.assertFalse(clients.is_launcher_cmd(["python.exe"]))
+
+
 class ApprovalMigration(unittest.TestCase):
     def test_imports_the_legacy_record_only_for_the_same_config(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as local, tempfile.TemporaryDirectory() as store:

@@ -51,6 +51,17 @@ def label_for(client_exe: str, script: str = "") -> str:
     return os.path.basename(client_exe or "") or "unknown client"
 
 
+def is_launcher_cmd(cmd: list[str]) -> bool:
+    """True only if launcher.py is the SCRIPT being run (first .py argument), not merely mentioned as an argument of some other script."""
+    if not cmd or cmd[0].replace("\\", "/").lower().rsplit("/", 1)[-1] not in ("python.exe", "pythonw.exe", "py.exe"):
+        return False  # the launcher is a Python script: only a Python interpreter running launcher.py is the launcher chain
+    for c in cmd[1:]:
+        c = c.replace("\\", "/").lower()
+        if c.endswith(".py"):
+            return c.rsplit("/", 1)[-1] == "launcher.py"
+    return False
+
+
 def find_client(pid: int) -> dict:
     """Walk up from the launcher process to the program that started it. Needs psutil; works from the elevated guardian for any process."""
     import psutil
@@ -65,7 +76,7 @@ def find_client(pid: int) -> dict:
             cmd = [c.lower() for c in cur.cmdline()]
         except Exception:
             cmd = []
-        if not any(c.endswith("launcher.py") for c in cmd):  # launcher and its venv shim both run launcher.py: keep walking up
+        if not is_launcher_cmd(cmd):  # the launcher and its venv shim both RUN launcher.py: keep walking up; anything else is the client
             break
         cur = cur.parent()
         if cur is None:
