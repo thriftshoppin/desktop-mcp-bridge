@@ -62,6 +62,8 @@ ap.add_argument("--count", type=int, default=1)
 ap.add_argument("--gap", type=int, default=300)
 ap.add_argument("--title", default="")
 ap.add_argument("--vk", type=int, default=0)
+ap.add_argument("--pid", type=int, default=0)
+ap.add_argument("--text", default="")
 ap.add_argument("--x", type=int, default=0)
 ap.add_argument("--y", type=int, default=0)
 a = ap.parse_args()
@@ -89,6 +91,31 @@ elif a.action == "close_window":
 
     user32.EnumWindows(PROC2(cb2), 0)
     res["closed"] = [h for h in found if user32.PostMessageW(h, 0x10, 0, 0)]  # WM_CLOSE, like the user clicking the X
+elif a.action == "console_type":
+    # AttachConsole(pid) + WriteConsoleInputW: the characters land in THAT process's console input buffer only (no focus, no other window involved)
+    class KEYREC(ctypes.Structure):
+        _fields_ = [("bKeyDown", wt.BOOL), ("wRepeatCount", wt.WORD), ("wVirtualKeyCode", wt.WORD), ("wVirtualScanCode", wt.WORD), ("uChar", wt.WCHAR), ("dwControlKeyState", wt.DWORD)]
+
+    class INREC(ctypes.Structure):
+        _fields_ = [("EventType", wt.WORD), ("pad", wt.WORD), ("Event", KEYREC)]  # 20 bytes, exactly like INPUT_RECORD
+
+    kernel32.FreeConsole()
+    ok = bool(kernel32.AttachConsole(a.pid))
+    res["attached"] = ok
+    if ok:
+        h = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+        recs = []
+        for ch in a.text.replace("\\r", "\r"):
+            for down in (True, False):
+                r = INREC()
+                r.EventType = 1
+                r.Event = KEYREC(down, 1, 0x0D if ch == "\r" else 0, 0, ch, 0)
+                recs.append(r)
+        arr = (INREC * len(recs))(*recs)
+        n = wt.DWORD()
+        res["written"] = bool(kernel32.WriteConsoleInputW(h, arr, len(recs), ctypes.byref(n)))
+        res["records"] = n.value
+        kernel32.FreeConsole()
 elif a.action == "hold_key":
     key(a.vk, False)
     time.sleep(a.hold / 1000)

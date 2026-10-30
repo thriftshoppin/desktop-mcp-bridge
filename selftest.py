@@ -872,25 +872,54 @@ async def s_shared(env):
 
 
 async def s_unknown_client(env):
-    """A client the user has never allowed: the guardian asks in the feed window and serves nothing until the user types y (a test cannot answer it)."""
+    """A client the user has never allowed: the guardian asks in the feed window and serves nothing until y is TYPED there (here by an elevated helper that writes into
+    that ONE test guardian's console by process id: it cannot reach any other window). The answer is remembered."""
     import tempfile as _tf
+    import psutil
     inst = f"st-uk-{UID}"
     empty = _tf.mkdtemp(prefix="bridge-state-empty-")
     from desktop_bridge import policy as _p
-    _p.Approval(ROOT, empty).approve()                     # config approved, but NO client allowed
+    from desktop_bridge import clients as _c
+    ap = _p.Approval(ROOT, empty)
+    ap.approve()                                           # config approved, but NO client allowed
     pr = subprocess.Popen([sys.executable, os.path.join(ROOT, "launcher.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
                           env={**os.environ, "DESKTOP_BRIDGE_INSTANCE": inst, "DESKTOP_BRIDGE_IDLE_EXIT_S": "6", "DESKTOP_BRIDGE_APPROVAL_DIR": empty})
     init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "selftest", "version": "1"}}})
     pr.stdin.write((init + "\n").encode())
     pr.stdin.flush()
-    await asyncio.sleep(9)
-    answered = pr.poll() is not None
-    feed = feed_log_text()
-    prompted = "to use the bridge? (y/N)" in feed
+    gpid = None
+    for _ in range(60):                                    # wait for the prompt in THIS instance's feed log
+        await asyncio.sleep(0.5)
+        for f in sorted((os.path.join(TMP, x) for x in os.listdir(TMP) if x.startswith("worker-") and x.endswith(".log")), key=os.path.getmtime, reverse=True)[:6]:
+            txt = open(f, encoding="utf-8", errors="replace").read()
+            if f"instance {inst}" in txt and "to use the bridge? (y/N)" in txt:
+                gpid = int(os.path.basename(f)[7:-4])
+                break
+        if gpid:
+            break
+    await asyncio.sleep(3)
+    still_waiting = pr.poll() is None
+    out_before = b""
+    record("T72 an UNKNOWN client is not served: the guardian asks in the feed window ('Allow client ... (y/N)') and answers nothing until y is typed there",
+           bool(gpid) and still_waiting, f"prompt printed in the feed of this test guardian (pid {gpid})={bool(gpid)}; launcher still waiting={still_waiting}")
+    if gpid:
+        out = os.path.join(TMP, f"helper-typey-{UID}.json")
+        run_helper("console_type", time.time() + 0.5, out, pid=gpid, text="y\\r")
+        info = await helper_result(out)
+        got = b""
+        try:
+            got = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, pr.stdout.readline), 15)
+        except asyncio.TimeoutError:
+            pass
+        await asyncio.sleep(0.5)
+        listing = {n: os.path.getsize(os.path.join(empty, n)) for n in os.listdir(empty)}
+        remembered_msg = "is now allowed (remembered)" in open(os.path.join(TMP, f"worker-{gpid}.log"), encoding="utf-8", errors="replace").read()
+        # (clients.json itself is not readable from this normal-integrity process: the elevated guardian created it in Python's private temp folder, which only grants its creator)
+        record("T72b typing y (then Enter) in the guardian's console allows the client: it is served at once and REMEMBERED (written to the allow-list)",
+               info.get("written") and b'"result"' in got and listing.get("clients.json", 0) > 100 and remembered_msg,
+               f"helper wrote {info.get('records')} key records into pid {gpid}'s console; initialize answered={b'result' in got}; clients.json written ({listing.get('clients.json')} bytes); guardian says 'now allowed (remembered)'={remembered_msg}")
     subprocess.run(["taskkill", "/PID", str(pr.pid), "/F", "/T"], capture_output=True)
     _recycle_dir(empty)
-    record("T72 an UNKNOWN client is not served: the guardian asks the user in the feed window ('Allow client ... (y/N)') and nothing is answered until then",
-           prompted and not answered, f"prompt printed in the feed={prompted}; launcher got no session (still waiting)={not answered}")
 
 
 async def s_overlay_fail(env):
