@@ -1,0 +1,33 @@
+{
+  "log": {
+    "enabled": true,
+    "script": "C:\\Users\\SysAdmin\\Claude\\log-tools\\Add-ClaudeLog.ps1",
+    "section": "desktop-bridge",
+    "log_typed_text": false,
+    "fail_closed": true,
+    "max_entry_chars": 700
+  },
+  "kill_switch": {
+    "hotkeys": ["ctrl+alt+pause", "ctrl+alt+shift+k"]
+  },
+  "denylist": ["KeePass*", "Bitwarden*", "1Password*", "Dashlane*", "LastPass*"],
+  "protected_paths": [
+    "C:\\Users\\SysAdmin\\Claude\\claude-actions-log.md",
+    "C:\\Users\\SysAdmin\\Claude\\log-tools"
+  ],
+  "audio": {
+    "device": null,
+    "probe_ms": 150
+  },
+  "temp_dir": "%TEMP%\\desktop-bridge",
+  "retention_hours": 24,
+  "screenshot": {
+    "max_edge": 1568,
+    "format": "jpeg",
+    "jpeg_quality": 85
+  },
+  "ui_tree": {
+    "max_nodes": 800,
+    "depth": 6
+  }
+}
