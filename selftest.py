@@ -922,6 +922,51 @@ async def s_unknown_client(env):
     _recycle_dir(empty)
 
 
+async def s_stale_answer(env):
+    """A 'y' typed into the guardian's console BEFORE a question exists (stale input) must not answer a later question for a different program."""
+    import tempfile as _tf
+    import psutil
+    inst = f"st-sa-{UID}"
+    store = _tf.mkdtemp(prefix="bridge-state-stale-")
+    from desktop_bridge import policy as _p
+    from desktop_bridge import clients as _c
+    _p.Approval(ROOT, store).approve()
+    me = psutil.Process(os.getpid())
+    _c.AllowList(store).add(_c.identity_key(me.exe(), os.path.abspath(sys.argv[0])), "selftest", me.exe())     # client A (this script) is allowed; client B (another script) is not
+    e = {**os.environ, "DESKTOP_BRIDGE_INSTANCE": inst, "DESKTOP_BRIDGE_IDLE_EXIT_S": "8", "DESKTOP_BRIDGE_APPROVAL_DIR": store}
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "selftest", "version": "1"}}})
+    a = subprocess.Popen([sys.executable, os.path.join(ROOT, "launcher.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, env=e)
+    a.stdin.write((init + "\n").encode())
+    a.stdin.flush()
+    line = a.stdout.readline()                                  # client A is served: the guardian is up
+    gpid = None
+    for f in sorted((os.path.join(TMP, x) for x in os.listdir(TMP) if x.startswith("worker-") and x.endswith(".log")), key=os.path.getmtime, reverse=True)[:6]:
+        if f"instance {inst}" in open(f, encoding="utf-8", errors="replace").read():
+            gpid = int(os.path.basename(f)[7:-4])
+            break
+    out = os.path.join(TMP, f"helper-stale-{UID}.json")
+    if gpid:
+        run_helper("console_type", time.time() + 0.5, out, pid=gpid, text="y\\r")   # the stale answer, typed while NO question is pending
+        await helper_result(out)
+    # client B = a different program (a tiny script that starts the launcher), so its identity is unknown
+    probe = os.path.join(TMP, f"probe_client_{UID}.py")
+    open(probe, "w").write("import subprocess,sys,time\np=subprocess.Popen([sys.executable,sys.argv[1]],stdin=subprocess.PIPE,stdout=subprocess.PIPE)\n"
+                           "p.stdin.write((sys.argv[2]+chr(10)).encode());p.stdin.flush();print(p.stdout.readline().decode()[:60],flush=True);time.sleep(30)\n")
+    b = subprocess.Popen([sys.executable, probe, os.path.join(ROOT, "launcher.py"), init], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, env=e)
+    await asyncio.sleep(7)
+    served = False
+    import select  # noqa: F401
+    b_alive = b.poll() is None
+    log = open(os.path.join(TMP, f"worker-{gpid}.log"), encoding="utf-8", errors="replace").read() if gpid else ""
+    asked = "Allow client" in log and "probe_client_" in log
+    auto = "is now allowed (remembered)" in log
+    record("T72c a STALE 'y' typed before the question existed does NOT answer a later question: the unknown program is still waiting for a real answer",
+           bool(gpid) and asked and not auto and b_alive, f"question asked for the probe program={asked}; auto-answered by the stale y={auto}; probe still waiting={b_alive}")
+    for pr in (b, a):
+        subprocess.run(["taskkill", "/PID", str(pr.pid), "/F", "/T"], capture_output=True)
+    _recycle_dir(store)
+
+
 async def s_overlay_fail(env):
     async with open_session({**env, "DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL": "1"}, f"st-ovf-{UID}") as c:
         s = await c.call("desktop_session_status")
@@ -1035,9 +1080,9 @@ async def main() -> int:
                         pass
             if not only:
                 await t_log(c, since)
-    sess_only = [n for n in (only or []) if n in ("launcher_kill", "shared", "unknown")]
+    sess_only = [n for n in (only or []) if n in ("launcher_kill", "shared", "unknown", "stale")]
     if sess_only:
-        fns = {"launcher_kill": lambda: t_launcher_kill(env), "shared": lambda: s_shared(env), "unknown": lambda: s_unknown_client(env)}
+        fns = {"launcher_kill": lambda: t_launcher_kill(env), "shared": lambda: s_shared(env), "unknown": lambda: s_unknown_client(env), "stale": lambda: s_stale_answer(env)}
         for n in sess_only:
             try:
                 await fns[n]()
@@ -1045,7 +1090,7 @@ async def main() -> int:
                 record("EXCEPTION in session test", False, f"{type(e).__name__}: {e}")
     if part in ("all", "sessions") and not only:
         await t_launcher_kill(env)
-        for fn in (lambda: s_shared(env), lambda: s_unknown_client(env), lambda: s_overlay_fail(env), lambda: s_approval_pending(), lambda: s_injection(env)):
+        for fn in (lambda: s_shared(env), lambda: s_unknown_client(env), lambda: s_stale_answer(env), lambda: s_overlay_fail(env), lambda: s_approval_pending(), lambda: s_injection(env)):
             try:
                 await fn()
             except Exception as e:

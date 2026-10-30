@@ -573,6 +573,8 @@ def main() -> None:
         import msvcrt
         with prompt_lock:
             feed.put(question, "yel")
+            time.sleep(0.5)  # let the question render, then throw away every key typed BEFORE it was visible (a stale 'y' must never answer a new question)
+            winapi.kernel32.FlushConsoleInputBuffer(winapi.kernel32.GetStdHandle(-10))
             buf: list[str] = []
             while True:
                 if cancel and cancel():
