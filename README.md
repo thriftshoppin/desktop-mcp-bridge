@@ -1,3 +1,6 @@
+> **Work in progress.** This is an early, personal build (working name "Desktop MCP Bridge") for one Windows PC. M0 (the "takeover core") is written and mostly tested; M1-M3 (processes/services/registry, screen recording, A/V correlation, batch) are not started.
+> Not production-ready and not hardened for public use: it runs an **elevated** worker that can see the screen and control the keyboard and mouse, and its safety checks are best-effort. Read SECURITY.md before running anything. Paths in `config.json` are specific to the author's machine.
+
 # Desktop MCP Bridge (working name)
 
 One local stdio MCP server that lets Claude use **this Windows PC** the way a person does: see the screen, read the UI tree,
