@@ -26,6 +26,7 @@ class Rec:
         self.target = ""
         self.args = dict(args)
         self.note = ""
+        self.show: list[str] = []  # extra lines for the live feed window (commands, output)
 
 
 class Bridge:
@@ -471,8 +472,9 @@ class Bridge:
         timeout = max(1.0, min(float(timeout), 3600.0))
         t0 = time.monotonic()
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd or None,
-                             creationflags=0x08000000)
+                             creationflags=0)  # shares the worker console: no hidden window
         killed_by = []
+        rec.show.append("RUN [" + shell_ + "] " + command[:600])
 
         def cancel():
             killed_by.append("kill switch")
@@ -500,6 +502,9 @@ class Bridge:
         cap = 100_000
         so, se = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
         rec.note = f"exit {p.returncode}"
+        for label, txt in (("out", so), ("err", se)):
+            for ln in txt.splitlines()[:25]:
+                rec.show.append(f"  {label}| {ln[:200]}")
         res = {"ok": True, "stdout": so[:cap], "stderr": se[:cap], "exit_code": p.returncode, "timed_out": timed_out,
                "truncated": len(so) > cap or len(se) > cap, "duration_ms": round((time.monotonic() - t0) * 1000)}
         if killed_by:

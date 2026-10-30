@@ -30,7 +30,7 @@ def clean_log_text(s: str, limit: int) -> str:
     s = _CTRL.sub(" ", s)
     s = s.encode("ascii", "backslashreplace").decode("ascii")  # PowerShell stdin is not UTF-8 safe
     s = re.sub(r"\s+", " ", s).strip()
-    return s if len(s) <= limit else s[: limit - 12] + "...[cut]"
+    return s if len(s) <= limit else s[: limit - 8] + "...[cut]"
 
 
 class LogWriter:
@@ -102,7 +102,7 @@ class LogWriter:
         self._ps = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="ascii",
-            errors="replace", creationflags=0x08000000)  # CREATE_NO_WINDOW
+            errors="replace")  # no CREATE_NO_WINDOW: the child shares the worker's visible console, so nothing is hidden
 
     def _write_persistent(self, text: str) -> bool:
         if self._ps is None or self._ps.poll() is not None:
@@ -129,7 +129,7 @@ class LogWriter:
         args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", self.script, "-Text", text]
         if self._first and self.section:
             args += ["-Section", self.section]
-        r = subprocess.run(args, capture_output=True, text=True, timeout=30, creationflags=0x08000000)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout)[:200])
 

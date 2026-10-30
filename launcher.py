@@ -40,12 +40,14 @@ def is_admin() -> bool:
 
 def start_worker(pipe: str, token: str):
     """Returns a process handle (int) or None. Raises RuntimeError when no way to start the elevated worker works."""
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    if not os.path.exists(pythonw):
-        pythonw = sys.executable
+    # VISIBLE by design: python.exe (console), shown in a normal window with the live action feed; never pythonw / SW_HIDE.
+    pythonw = sys.executable
     params = f"-m desktop_bridge.worker --pipe {pipe} --token {token} --launcher-pid {SELF_PID}"
     if is_admin():  # already elevated (e.g. started from an admin shell): no need for runas
-        subprocess.Popen([pythonw] + params.split(), cwd=ROOT, creationflags=0x08000000)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags = 1  # STARTF_USESHOWWINDOW
+        si.wShowWindow = 4  # SW_SHOWNOACTIVATE
+        subprocess.Popen([pythonw] + params.split(), cwd=ROOT, creationflags=0x10, startupinfo=si)  # CREATE_NEW_CONSOLE
         return None
     sei = SHELLEXECUTEINFOW()
     sei.cbSize = ctypes.sizeof(sei)
@@ -54,7 +56,7 @@ def start_worker(pipe: str, token: str):
     sei.lpFile = pythonw
     sei.lpParameters = params
     sei.lpDirectory = ROOT
-    sei.nShow = 0  # SW_HIDE
+    sei.nShow = 4  # SW_SHOWNOACTIVATE: visible, but does not steal focus
     if ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
         return sei.hProcess
     code = ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
@@ -64,7 +66,7 @@ def start_worker(pipe: str, token: str):
     path = os.path.join(hp, "handoff.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"pipe": pipe, "token": token, "pid": SELF_PID}, f)
-    r = subprocess.run(["schtasks", "/run", "/tn", TASK_NAME], capture_output=True, text=True, creationflags=0x08000000)
+    r = subprocess.run(["schtasks", "/run", "/tn", TASK_NAME], capture_output=True, text=True)
     if r.returncode != 0:
         try:
             os.remove(path)

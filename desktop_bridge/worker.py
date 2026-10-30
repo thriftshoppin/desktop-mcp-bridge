@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import ctypes
 import hmac
 import io
 import json
 import msvcrt
 import os
+import queue
 import sys
 import threading
 import time
@@ -34,16 +36,52 @@ from mcp.server.stdio import stdio_server
 SERVER_NAME = "desktop-bridge"
 HOLD = {}
 
+class Feed:
+    """Visible live action feed: a normal console window the user can watch. Printing happens on its own thread so a
+    stalled console can never block a tool call. Everything is also tee'd to a per-pid log file in the temp dir."""
 
-def _debug_file(cfg: dict) -> None:
-    try:
-        os.makedirs(cfg["temp_dir"], exist_ok=True)
-        f = open(os.path.join(cfg["temp_dir"], f"worker-{os.getpid()}.log"), "w", buffering=1, encoding="utf-8")
-        sys.stdout = f
-        sys.stderr = f
-        HOLD["dbg"] = f
-    except Exception:
-        pass
+    COL = {"red": "\x1b[91m", "yel": "\x1b[93m", "grn": "\x1b[92m", "dim": "\x1b[90m", "": ""}
+
+    def __init__(self, cfg: dict):
+        self.q: queue.Queue = queue.Queue()
+        self.file = None
+        try:
+            os.makedirs(cfg["temp_dir"], exist_ok=True)
+            self.file = open(os.path.join(cfg["temp_dir"], f"worker-{os.getpid()}.log"), "w", buffering=1, encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            winapi.kernel32.SetConsoleTitleW("Desktop Bridge - live action feed (close this window to stop the worker)")
+            hin = winapi.kernel32.GetStdHandle(-10)
+            mode = ctypes.c_uint()
+            winapi.kernel32.GetConsoleMode(hin, ctypes.byref(mode))
+            winapi.kernel32.SetConsoleMode(hin, (mode.value & ~0x0040) | 0x0080)  # QuickEdit off: a stray click must not freeze output
+            hout = winapi.kernel32.GetStdHandle(-11)
+            winapi.kernel32.GetConsoleMode(hout, ctypes.byref(mode))
+            winapi.kernel32.SetConsoleMode(hout, mode.value | 0x0004)  # ANSI colours
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        threading.Thread(target=self._run, name="feed", daemon=True).start()
+
+    def put(self, text: str, color: str = "") -> None:
+        self.q.put((time.strftime("%H:%M:%S"), text, color))
+
+    def _run(self) -> None:
+        while True:
+            ts, text, color = self.q.get()
+            line = f"{ts} {text}"
+            try:
+                print(f"{self.COL.get(color, '')}{line}\x1b[0m" if color else line, flush=True)
+            except Exception:
+                pass
+            if self.file:
+                try:
+                    self.file.write(line + chr(10))
+                except Exception:
+                    pass
+
 
 
 def _fmt_args(a: dict) -> str:
@@ -130,7 +168,7 @@ def _watch_launcher(pid: int, on_exit) -> None:
 
 # ----------------------------------------------------------------------------- MCP server
 
-def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch):
+def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed"):
     ui = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ui", initializer=_init_ui)
     misc = ThreadPoolExecutor(max_workers=6, thread_name_prefix="misc")
     server = MCPServer(SERVER_NAME, instructions=(
@@ -166,7 +204,11 @@ def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch):
             result = {"ok": False, "error": {"code": "INTERNAL", "message": f"{type(e).__name__}: {str(e)[:300]}"}}
             print(traceback.format_exc(), file=sys.stderr)
         ms = round((time.perf_counter() - t0) * 1000)
-        log.log(f"{name} target={rec.target or '-'} {_fmt_args(rec.args)} -> {status}{(' ' + rec.note) if rec.note else ''} ({ms} ms)")
+        line = f"{name} target={rec.target or '-'} {_fmt_args(rec.args)} -> {status}{(' ' + rec.note) if rec.note else ''} ({ms} ms)"
+        log.log(line)
+        feed.put(line, "grn" if status == "OK" else "red" if "KILL" in status else "yel")
+        for extra in rec.show:
+            feed.put("    " + extra, "dim")
         content: list = []
         if image is not None:
             content.append(mt.ImageContent(type="image", data=base64.b64encode(image[0]).decode(), mime_type=f"image/{image[1]}"))
@@ -312,7 +354,7 @@ def main() -> None:
     ap.add_argument("--handoff", action="store_true", help="read pipe/token/pid from the per-user handoff file (scheduled-task start)")
     args = ap.parse_args()
     cfg = config_mod.load()
-    _debug_file(cfg)
+    feed = Feed(cfg)
     winapi.set_dpi_aware()
     if args.handoff:
         hp = os.path.join(os.environ["LOCALAPPDATA"], "desktop-bridge", "handoff.json")
@@ -336,12 +378,18 @@ def main() -> None:
         stopping.set()
         try:
             log.log(f"desktop-bridge worker stopping: {reason}")
+            feed.put(f"worker stopping: {reason}", "yel")
+            time.sleep(0.3)
             log.close()
         finally:
             os._exit(code)
 
-    ks = KillSwitch(cfg["kill_switch"]["hotkeys"], on_trip=lambda src: (log.log(f"KILL SWITCH tripped by {src}; all tools refuse until desktop_resume"),
-                                                                       winapi.user32.MessageBeep(0x30)))
+    def on_trip(src):
+        log.log(f"KILL SWITCH tripped by {src}; all tools refuse until desktop_resume")
+        feed.put(f"*** KILL SWITCH tripped by {src}: every tool refuses until desktop_resume ***", "red")
+        winapi.user32.MessageBeep(0x30)
+
+    ks = KillSwitch(cfg["kill_switch"]["hotkeys"], on_trip=on_trip)
     B = tools.Bridge(cfg, log, ks)
     try:
         n = safety.clear_old_temp(cfg["temp_dir"], float(cfg.get("retention_hours", 24)))
@@ -358,7 +406,9 @@ def main() -> None:
     except Exception as e:
         shutdown(f"handshake failed: {e}", 3)
         return
-    server = build_server(B, log, ks)
+    feed.put("Desktop Bridge worker - everything Claude does through it appears here (and in the actions log).", "grn")
+    feed.put(f"pid {os.getpid()}  elevated={winapi.is_elevated()}  integrity={winapi.integrity_level()}  kill switch: {' / '.join(ks.combos)}", "dim")
+    server = build_server(B, log, ks, feed)
 
     stdin = anyio.wrap_file(io.TextIOWrapper(rin, encoding="utf-8", newline="\n"))
     stdout = anyio.wrap_file(io.TextIOWrapper(wout, encoding="utf-8", newline="\n", write_through=True))
