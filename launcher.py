@@ -96,7 +96,7 @@ def open_pipe(path: str, mode: str, h, deadline: float):
             last = e
         code = worker_exited(h)
         if code is not None:
-            raise RuntimeError(f"worker exited early (code {code}); see %TEMP%\\desktop-bridge\\worker.log")
+            raise RuntimeError(f"worker exited early (code {code}); see %TEMP%\\desktop-bridge\\worker-<pid>.log")
         time.sleep(0.1)
     raise RuntimeError(f"could not open {path}: {last}")
 

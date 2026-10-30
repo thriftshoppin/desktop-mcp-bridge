@@ -1,0 +1,13 @@
+{
+  "name": "desktop-bridge",
+  "displayName": "Desktop MCP Bridge",
+  "version": "0.1.0",
+  "description": "Personal, local-only desktop control for this Windows PC: screenshots, UI Automation, click/type/keys, launch, clipboard, files (Recycle Bin deletes), shell, audio level. Runs an elevated worker in a visible console window with a live action feed. Not affiliated with Anthropic.",
+  "license": "UNLICENSED",
+  "mcpServers": {
+    "desktop": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/launcher.py"]
+    }
+  }
+}

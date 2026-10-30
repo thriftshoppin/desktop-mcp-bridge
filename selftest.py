@@ -260,13 +260,13 @@ async def t_password(c: Client):
 
 
 async def t_kill(c: Client):
-    from desktop_bridge.winapi import parse_combo, press_combo
     for combo in ("ctrl+alt+pause", "ctrl+alt+shift+k"):
         name = f"T10 kill switch {combo}: halts a running wait, refuses next call until desktop_resume"
         task = asyncio.create_task(c.call("desktop_wait", seconds=30))
         await asyncio.sleep(1.0)
         t0 = time.perf_counter()
-        press_combo(parse_combo(combo))
+        # injected from the ELEVATED worker itself: a Medium process cannot trigger a hotkey owned by a High-integrity one (UIPI)
+        await c.call("desktop_key", combo=combo)
         try:
             res = await asyncio.wait_for(task, 6)
         except asyncio.TimeoutError:
@@ -374,6 +374,7 @@ async def t_log(c: Client, since: str):
 
 
 async def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     since = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"Desktop Bridge M0 selftest, {since}. Windows will open; hands off the mouse/keyboard until it finishes.\n", flush=True)
     t_unit()

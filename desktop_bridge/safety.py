@@ -255,10 +255,30 @@ class KillSwitch:
                 self.registered[combo] = False
                 self.errors[combo] = str(e)
         self._ready.set()
+        # Belt and braces: RegisterHotKey does not fire when no window has the foreground (e.g. right after the last window
+        # closed), so also poll the async key state of the two combos (only these keys are looked at, nothing is recorded).
+        polls = []
+        for combo in self.combos:
+            try:
+                polls.append((combo, parse_combo(combo)))
+            except Exception:
+                pass
+        was_down = {c: False for c, _ in polls}
         msg = wt.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == 0x0312 and msg.wParam in ids:  # WM_HOTKEY
-                self.trip(f"hotkey {ids[msg.wParam]}")
+        running = True
+        while running:
+            user32.MsgWaitForMultipleObjects(0, None, False, 25, 0x04FF)  # wake on any message or after 25 ms
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                if msg.message == 0x0012:  # WM_QUIT
+                    running = False
+                    break
+                if msg.message == 0x0312 and msg.wParam in ids:  # WM_HOTKEY
+                    self.trip(f"hotkey {ids[msg.wParam]}")
+            for combo, vks in polls:
+                down = all(user32.GetAsyncKeyState(v) & 0x8000 for v in vks)
+                if down and not was_down[combo]:
+                    self.trip(f"key state {combo}")
+                was_down[combo] = down
         for i in ids:
             user32.UnregisterHotKey(None, i)
 
