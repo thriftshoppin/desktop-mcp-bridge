@@ -43,6 +43,8 @@ def start_worker(pipe: str, token: str):
     # VISIBLE by design: python.exe (console), shown in a normal window with the live action feed; never pythonw / SW_HIDE.
     pythonw = sys.executable
     params = f"-m desktop_bridge.worker --pipe {pipe} --token {token} --launcher-pid {SELF_PID}"
+    if os.environ.get("DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL"):  # test hook; can only make the worker more restrictive
+        params += " --force-overlay-fail"
     if is_admin():  # already elevated (e.g. started from an admin shell): no need for runas
         si = subprocess.STARTUPINFO()
         si.dwFlags = 1  # STARTF_USESHOWWINDOW

@@ -8,12 +8,26 @@
     "max_entry_chars": 700
   },
   "kill_switch": {
-    "hotkeys": ["ctrl+alt+pause", "ctrl+alt+shift+k"]
+    "hotkeys": [
+      "ctrl+alt+pause",
+      "ctrl+alt+shift+k"
+    ]
   },
-  "denylist": ["KeePass*", "Bitwarden*", "1Password*", "Dashlane*", "LastPass*"],
+  "denylist": [
+    "KeePass*",
+    "Bitwarden*",
+    "1Password*",
+    "Dashlane*",
+    "LastPass*"
+  ],
   "protected_paths": [
     "C:\\Users\\SysAdmin\\Claude\\claude-actions-log.md",
-    "C:\\Users\\SysAdmin\\Claude\\log-tools"
+    "C:\\Users\\SysAdmin\\Claude\\log-tools",
+    "C:\\Users\\SysAdmin\\tools\\claude-desktop-bridge\\config.json",
+    "C:\\Users\\SysAdmin\\tools\\claude-desktop-bridge\\config.local.json",
+    "C:\\Users\\SysAdmin\\tools\\claude-desktop-bridge\\skills",
+    "C:\\Users\\SysAdmin\\tools\\claude-desktop-bridge\\SECURITY.md",
+    "%LOCALAPPDATA%\\desktop-bridge"
   ],
   "audio": {
     "device": null,
@@ -29,5 +43,21 @@
   "ui_tree": {
     "max_nodes": 800,
     "depth": 6
-  }
+  },
+  "downloads": "ask",
+  "control": {
+    "idle_grace_s": 8,
+    "border_lead_ms": 150,
+    "glide_ms_min": 120,
+    "glide_ms_max": 300,
+    "type_ms_per_char": 8,
+    "value_method_min_chars": 200
+  },
+  "overlay": {
+    "color": "#FF8C00",
+    "thickness_px": 6
+  },
+  "blocked_combos": [
+    "win+l"
+  ]
 }

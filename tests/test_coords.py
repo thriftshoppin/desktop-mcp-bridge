@@ -1,4 +1,4 @@
-﻿"""Unit tests for desktop_bridge.coords (pure, no Windows calls). Run: .venv\\Scripts\\python.exe -m unittest discover tests"""
+"""Unit tests for desktop_bridge.coords (pure, no Windows calls). Run: .venv\\Scripts\\python.exe -m unittest discover tests"""
 import os
 import sys
 import unittest

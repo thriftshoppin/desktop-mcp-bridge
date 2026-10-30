@@ -12,11 +12,22 @@ import subprocess
 import threading
 import time
 
-from . import capture, coords, safety, uia, winapi
+from . import capture, coords, policy, safety, uia, winapi
 from .coords import Monitor
 from .safety import ToolRefused
 
 PROTECTED_CLASSES = {"Progman", "WorkerW"}
+FEED_TITLE = "Desktop Bridge - live action feed"
+IGNORED_WINDOW_CLASSES = {"IME", "MSCTFIME UI", "GDI+ Hook Window Class", "CicMarshalWndClass", "tooltips_class32"}
+
+
+def console_root() -> int:
+    """The feed window: the console window (or, under Windows Terminal, its owner window)."""
+    h = winapi.kernel32.GetConsoleWindow()
+    if not h:
+        return 0
+    r = winapi.user32.GetAncestor(h, 3)  # GA_ROOTOWNER
+    return int(r or h)
 
 
 class Rec:
@@ -43,6 +54,13 @@ class Bridge:
         self.protected: list[str] = cfg.get("protected_paths", [])
         self.blocked_combos = {c.replace(" ", "").lower() for c in cfg.get("blocked_combos", ["win+l"])}
         self.log_typed = bool(cfg.get("log", {}).get("log_typed_text", False))
+        self.protected = [os.path.expandvars(p) for p in self.protected]
+        self.downloads_mode: str = cfg.get("downloads", "ask")
+        self.overlay = None   # set by worker
+        self.control = None   # set by worker
+        self.say = lambda *a, **k: None  # set by worker: prints a line in the live feed window
+        self.approved = threading.Event()  # config.json approval (set by worker after the user answers in the feed window)
+        self.approval_info: dict = {}
 
     # ------------------------------------------------------------------ helpers
     def monitors(self, fresh: bool = False) -> list[Monitor]:
@@ -106,6 +124,59 @@ class Bridge:
         if bad:
             raise ToolRefused("DENYLISTED", f"Input to '{bad}' is blocked by the process denylist.")
 
+    # ------------------------------------------------------------------ feed window (never hidden or minimized)
+    def feed_window_state(self) -> dict:
+        h = console_root()
+        if not h:
+            return {"hwnd": 0, "visible": False, "minimized": False}
+        return {"hwnd": h, "visible": bool(winapi.user32.IsWindowVisible(h)), "minimized": bool(winapi.user32.IsIconic(h))}
+
+    def ensure_feed_visible(self) -> bool:
+        """Restore the feed window if it was minimized/hidden or is off-screen, without taking keyboard focus. True if it had to be restored."""
+        h = console_root()
+        if not h:
+            return False
+        fixed = False
+        if winapi.user32.IsIconic(h) or not winapi.user32.IsWindowVisible(h):
+            winapi.user32.ShowWindow(h, 4)  # SW_SHOWNOACTIVATE
+            fixed = True
+        r = winapi.window_rect(h)
+        if not any(coords.intersect(r, m.rect) for m in self.monitors()):
+            self.place_feed()
+            fixed = True
+        if fixed:
+            self.say("feed window was hidden/minimized/off-screen: restored", "yel")
+        return fixed
+
+    def place_feed(self) -> None:
+        h = console_root()
+        if not h:
+            return
+        m = next((m for m in self.monitors(fresh=True) if m.primary), None)
+        if m is None:
+            return
+        w, hh = 900, 380
+        x, y = m.x + m.w - w - 20, m.y + m.h - hh - 70
+        winapi.user32.SetWindowPos(h, 0, x, y, w, hh, 0x10 | 0x40)  # SWP_NOACTIVATE | SWP_SHOWWINDOW
+
+    def children_audit(self) -> list[dict]:
+        """Child processes of the worker: each must share the visible feed console or own a visible window. Nothing hidden."""
+        import ctypes
+        import psutil
+        try:
+            buf = (ctypes.c_uint * 64)()
+            n = winapi.kernel32.GetConsoleProcessList(buf, 64)
+            on_console = set(buf[:n]) if n <= 64 else set()
+            byp = winapi.windows_by_pid()
+            out = []
+            for c in psutil.Process().children(recursive=True):
+                wins = [w for w in byp.get(c.pid, []) if w["class"] not in IGNORED_WINDOW_CLASSES]
+                out.append({"pid": c.pid, "name": c.name(), "on_feed_console": c.pid in on_console,
+                            "visible_windows": sum(1 for w in wins if w["visible"]), "hidden_windows": [w["class"] for w in wins if not w["visible"]]})
+            return out
+        except Exception as e:
+            return [{"error": str(e)}]
+
     # ------------------------------------------------------------------ session / displays
     def session_status(self, rec: Rec) -> dict:
         s = winapi.session_info()
@@ -119,6 +190,14 @@ class Bridge:
             "log": self.log.stats(),
             "foreground": {"hwnd": fg, "title": winapi.window_text(fg), "process": winapi.process_info(winapi.window_pid(fg))[0]} if fg else None,
             "monitors": len(mons),
+            "in_control": bool(self.control and self.control.in_control()),
+            "idle_grace_s": self.control.grace if self.control else None,
+            "overlay": {"ok": bool(self.overlay and self.overlay.ok), "visible": bool(self.overlay and self.overlay.visible),
+                        "excluded_from_capture": bool(self.overlay and self.overlay.exclude and self.overlay.affinity_ok),
+                        "error": (self.overlay.error if self.overlay else "not created")},
+            "feed_window": self.feed_window_state(),
+            "config_approved": self.approved.is_set(),
+            "children": self.children_audit(),
             "capture": {"engine_order": ["dxcam", "mss"], "rdp_forces": "mss"},
         }
 
@@ -233,6 +312,7 @@ class Bridge:
         if h is None:
             raise ToolRefused("BAD_ARGS", "Give hwnd or title.")
         rec.target = f"window {h} '{winapi.window_text(h)[:40]}'"
+        self._check_not_self(h)
         self._check_input_target(hwnd=h)
         ok = winapi.focus_window(h)
         return {"ok": True, "focused": ok, "hwnd": h, "title": winapi.window_text(h), "foreground": winapi.foreground_hwnd(),
@@ -290,7 +370,27 @@ class Bridge:
         return {"ok": True, "matches": res, "count": len(res), "truncated": truncated,
                 "elapsed_ms": round((time.monotonic() - t0) * 1000)}
 
-    # ------------------------------------------------------------------ input
+    # ------------------------------------------------------------------ input (visible: real cursor glide, halo, real keystrokes)
+    def _self_hwnds(self) -> set[int]:
+        s = {console_root(), int(winapi.kernel32.GetConsoleWindow() or 0)}
+        if self.overlay is not None:
+            s |= self.overlay.hwnds()
+        s.discard(0)
+        return s
+
+    def _is_self(self, hwnd: int) -> bool:
+        if not hwnd:
+            return False
+        root = int(winapi.user32.GetAncestor(hwnd, 2) or hwnd)  # GA_ROOT
+        if root in self._self_hwnds():
+            return True
+        return FEED_TITLE.lower() in winapi.window_text(root).lower()
+
+    def _check_not_self(self, hwnd: int) -> None:
+        if self._is_self(hwnd):
+            raise ToolRefused("SELF_TARGET_REFUSED", "Refused: that target is the bridge's own feed window or overlay. Claude may not click, type or "
+                              "send keys there (it could answer the bridge's approval prompts).")
+
     def _element_point(self, ref: str) -> tuple[int, int, object]:
         c = self.refs.get(ref)
         bad = self._deny_pid(c.ProcessId)
@@ -301,27 +401,18 @@ class Bridge:
             raise ToolRefused("NO_RECT", f"Element '{ref}' has no on-screen rectangle (offscreen or hidden).")
         return (r[0] + r[2] // 2, r[1] + r[3] // 2, c)
 
-    def click(self, rec: Rec, ref: str | None = None, x: float | None = None, y: float | None = None, button: str = "left",
-              count: int = 1, modifiers: list[str] | None = None, coords_space: str = "shot") -> dict:
+    def _pointer_click(self, px: int, py: int, button: str = "left", count: int = 1, modifiers: list[str] | None = None) -> dict:
+        """The real mouse: eased glide to the point, halo on the overlay, then a real click. Never an invoke pattern."""
+        import ctypes.wintypes as wt
         if button not in winapi.MOUSE_FLAGS:
             raise ToolRefused("BAD_ARGS", "button must be left, right or middle")
         count = max(1, min(int(count), 3))
-        if ref:
-            px, py, c = self._element_point(ref)
-            rec.target = f"{ref} {uia.role_of(c)} '{(c.Name or '')[:40]}'"
-        elif x is not None and y is not None:
-            px, py = self._to_real(float(x), float(y), coords_space)
-            mons = self.monitors()
-            if coords.monitor_at(mons, px, py) is None:
-                raise ToolRefused("OFFSCREEN", f"Point {px},{py} is not on any monitor.")
-            rec.target = f"point {px},{py}"
-        else:
-            raise ToolRefused("BAD_ARGS", "Give ref, or x and y.")
-        # window under the point (denylist + report)
-        import ctypes.wintypes as wt
+        if coords.monitor_at(self.monitors(), px, py) is None:
+            raise ToolRefused("OFFSCREEN", f"Point {px},{py} is not on any monitor.")
         hw = winapi.user32.WindowFromPoint(wt.POINT(px, py))
-        root = winapi.user32.GetAncestor(hw, 2) if hw else 0  # GA_ROOT
+        root = int(winapi.user32.GetAncestor(hw, 2)) if hw else 0  # GA_ROOT
         if root:
+            self._check_not_self(root)
             self._check_input_target(hwnd=root)
         mod_vks = []
         for mname in modifiers or []:
@@ -329,7 +420,10 @@ class Bridge:
                 raise ToolRefused("BAD_ARGS", f"unknown modifier {mname!r}")
             mod_vks.append(winapi.VK[mname.lower()])
         self.ks.check()
-        winapi.move_cursor(px, py)
+        cc = self.cfg.get("control", {})
+        ms = winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), self.ks.check)
+        if self.overlay is not None:
+            self.overlay.halo(px, py)
         time.sleep(0.03)
         held = []
         try:
@@ -340,25 +434,46 @@ class Bridge:
         finally:
             for v in reversed(held):
                 winapi.key_event(v, True)
-        mons = self.monitors()
-        m = coords.monitor_at(mons, px, py)
-        return {"ok": True, "clicked": [px, py], "monitor": m.id if m else None,
-                "window": winapi.window_text(root)[:80] if root else None, "button": button, "count": count}
+        m = coords.monitor_at(self.monitors(), px, py)
+        return {"ok": True, "clicked": [px, py], "monitor": m.id if m else None, "window": winapi.window_text(root)[:80] if root else None,
+                "button": button, "count": count, "glide_ms": round(ms)}
 
-    def type_text(self, rec: Rec, text: str, ref: str | None = None, replace: bool | None = None) -> dict:
+    def click(self, rec: Rec, ref: str | None = None, x: float | None = None, y: float | None = None, button: str = "left",
+              count: int = 1, modifiers: list[str] | None = None, coords_space: str = "shot") -> dict:
+        if ref:
+            px, py, c = self._element_point(ref)
+            rec.target = f"{ref} {uia.role_of(c)} '{(c.Name or '')[:40]}'"
+        elif x is not None and y is not None:
+            px, py = self._to_real(float(x), float(y), coords_space)
+            rec.target = f"point {px},{py}"
+        else:
+            raise ToolRefused("BAD_ARGS", "Give ref, or x and y.")
+        return self._pointer_click(px, py, button, count, modifiers)
+
+    def type_text(self, rec: Rec, text: str, ref: str | None = None, method: str = "keys", clear: bool = False) -> dict:
+        """Default: a visible click on the target (if ref) and real keystrokes at a visible pace. method='value' (ValuePattern.SetValue)
+        is opt-in, needs a ref, and only for long text (control.value_method_min_chars)."""
         import uiautomation as auto
+        cc = self.cfg.get("control", {})
         n = len(text)
+        if method not in ("keys", "value"):
+            raise ToolRefused("BAD_ARGS", "method must be 'keys' (default) or 'value'")
+        if method == "value":
+            if not ref:
+                raise ToolRefused("BAD_ARGS", "method='value' needs a ref")
+            need = int(cc.get("value_method_min_chars", 200))
+            if n < need:
+                raise ToolRefused("VALUE_METHOD_TOO_SHORT", f"method='value' is only for long text (>= {need} chars); this is {n}. Use the default visible typing.")
         c = None
         if ref:
-            c = self.refs.get(ref)
+            px, py, c = self._element_point(ref)
             rec.target = f"{ref} {uia.role_of(c)} '{(c.Name or '')[:40]}'"
-            bad = self._deny_pid(c.ProcessId)
-            if bad:
-                raise ToolRefused("DENYLISTED", f"Input to '{bad}' is blocked by the process denylist.")
             if uia.is_password(c):
                 rec.args["text"] = "[redacted]"
                 raise ToolRefused("PASSWORD_FIELD", "That field is a password field; typing into it is refused.")
         else:
+            fg = winapi.foreground_hwnd()
+            self._check_not_self(fg)
             self._check_input_target()
             try:
                 fc = auto.GetFocusedControl()
@@ -371,24 +486,24 @@ class Bridge:
                     raise ToolRefused("PASSWORD_FIELD", "The focused field is a password field; typing into it is refused.")
         rec.args["text"] = text if self.log_typed else f"[omitted {n} chars]"
         self.ks.check()
-        method = "sendinput"
         if c is not None:
-            try:
-                c.SetFocus()
-            except Exception:
-                pass
-            use_value = replace if replace is not None else True
-            if use_value:
-                try:
-                    vp = c.GetValuePattern()
-                    if vp is not None and not vp.IsReadOnly:
-                        vp.SetValue(text)
-                        return {"ok": True, "typed": n, "method": "ValuePattern.SetValue (replaced the field's value)"}
-                except Exception:
-                    pass
-            time.sleep(0.05)
-        winapi.type_text(text, check=self.ks.check)
-        return {"ok": True, "typed": n, "method": "SendInput unicode"}
+            self._pointer_click(px, py)  # visible click to focus the target
+            time.sleep(0.08)
+        if method == "value":
+            self.say(f"type method=value: ValuePattern.SetValue of {n} chars into {rec.target} (opt-in, long text)", "yel")
+            vp = c.GetValuePattern()
+            if vp is None or vp.IsReadOnly:
+                raise ToolRefused("NO_VALUE_PATTERN", "That element does not accept a value; use the default typing.")
+            vp.SetValue(text)
+            return {"ok": True, "typed": n, "method": "ValuePattern.SetValue (announced in the feed)"}
+        if clear:
+            winapi.press_combo(winapi.parse_combo("ctrl+a"), check=self.ks.check)
+            winapi.press_combo(winapi.parse_combo("delete"), check=self.ks.check)
+        per = float(cc.get("type_ms_per_char", 8))
+        t0 = time.perf_counter()
+        winapi.type_text(text, delay_ms=per, check=self.ks.check)
+        el = (time.perf_counter() - t0) * 1000
+        return {"ok": True, "typed": n, "method": "keystrokes", "ms_per_char": round(el / max(n, 1), 1)}
 
     def key(self, rec: Rec, combo: str, repeat: int = 1) -> dict:
         norm = combo.replace(" ", "").lower()
@@ -397,6 +512,7 @@ class Bridge:
         vks = winapi.parse_combo(combo)
         fg = winapi.foreground_hwnd()
         rec.target = f"fg '{winapi.window_text(fg)[:40]}'" if fg else "no foreground"
+        self._check_not_self(fg)
         self._check_input_target()
         for _ in range(max(1, min(int(repeat), 50))):
             self.ks.check()
@@ -414,10 +530,13 @@ class Bridge:
 
     # ------------------------------------------------------------------ apps / clipboard
     def launch(self, rec: Rec, app: str, args: list[str] | None = None, cwd: str | None = None, wait_ms: int = 3000,
-               elevated: bool = True) -> dict:
+               elevated: bool = True, user_requested_download: bool = False) -> dict:
         from win32com.shell import shell, shellcon
         import win32process
         rec.target = app
+        for n in policy.launch_gate(app, args, self.protected, user_requested_download, self.downloads_mode):
+            self.say("!!! " + n, "yel")
+            rec.note += n + " "
         params = subprocess.list2cmdline(args) if args else ""
         before = set(winapi.list_top_windows())
         info = shell.ShellExecuteEx(fMask=shellcon.SEE_MASK_NOCLOSEPROCESS, lpVerb="open", lpFile=app,
@@ -434,7 +553,7 @@ class Bridge:
                 win32api.CloseHandle(h)
             except Exception:
                 pass
-        new = []
+        new: list[int] = []
         end = time.monotonic() + max(0, wait_ms) / 1000
         while time.monotonic() < end:
             self.ks.check()
@@ -444,9 +563,23 @@ class Bridge:
                 if pid is None or any(winapi.window_pid(w) == pid for w in cur):
                     break
             time.sleep(0.1)
-        return {"ok": True, "pid": pid, "new_windows": [{"hwnd": w, "title": winapi.window_text(w)[:100], "process": winapi.process_info(winapi.window_pid(w))[0],
-                "pid": winapi.window_pid(w)} for w in new],
-                "elevated": winapi.is_elevated(), "note": "The worker runs elevated, so launched programs are elevated too (the 'elevated' parameter is kept for compatibility)."}
+        wins = []
+        for w in new:
+            st = winapi.window_state(w)
+            restored = False
+            if st == "minimized":  # apps open visibly, in a normal window state
+                winapi.user32.ShowWindow(w, 4)  # SW_SHOWNOACTIVATE
+                if winapi.window_state(w) == "minimized":
+                    winapi.user32.ShowWindow(w, 9)  # SW_RESTORE
+                st, restored = winapi.window_state(w), True
+            wins.append({"hwnd": w, "title": winapi.window_text(w)[:100], "process": winapi.process_info(winapi.window_pid(w))[0],
+                         "pid": winapi.window_pid(w), "state": st, "restored_from_minimized": restored})
+        out = {"ok": True, "pid": pid, "visible_window": bool(wins), "new_windows": wins, "elevated": winapi.is_elevated(),
+               "note": "The worker runs elevated, so launched programs are elevated too (the 'elevated' parameter is kept for compatibility)."}
+        if not wins:
+            out["note"] = "started with no visible window"
+            self.say(f"launch {app}: started with NO visible window (pid {pid})", "yel")
+        return out
 
     def clipboard_get(self, rec: Rec) -> dict:
         t = winapi.clipboard_get()
@@ -460,7 +593,10 @@ class Bridge:
 
     # ------------------------------------------------------------------ run / fs
     def run(self, rec: Rec, command: str, shell_: str = "powershell", timeout: float = 60, cwd: str | None = None,
-            elevated: bool = True) -> dict:
+            elevated: bool = True, user_requested_download: bool = False) -> dict:
+        for n in policy.command_gate(command, self.protected, user_requested_download, self.downloads_mode):
+            self.say("!!! " + n, "yel")
+            rec.note += n + " "
         shell_ = shell_.lower()
         if shell_ == "powershell":
             argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
@@ -512,8 +648,11 @@ class Bridge:
         return res
 
     def fs(self, rec: Rec, op: str, path: str, dest: str | None = None, content: str | None = None, encoding: str = "utf-8",
-           append: bool = False, max_bytes: int = 1_048_576, create_dirs: bool = True, limit: int = 500) -> dict:
+           append: bool = False, max_bytes: int = 1_048_576, create_dirs: bool = True, limit: int = 500,
+           user_requested_download: bool = False) -> dict:
         op = op.lower()
+        for n in policy.fs_gate([path, dest or ""], user_requested_download, self.downloads_mode):
+            self.say("!!! " + n, "yel")
         path = os.path.abspath(os.path.expandvars(path))
         rec.target = path
         dest = os.path.abspath(os.path.expandvars(dest)) if dest else None
@@ -592,7 +731,9 @@ class Bridge:
         return {"ok": True, **res}
 
     def resume(self, rec: Rec) -> dict:
-        was = self.ks.resume()
+        was = self.ks.resume()  # raises INJECTION_LOCKOUT when the lockout was set by the injection gate
+        if self.control:
+            self.control.on_resume()
         return {"ok": True, "was_active": was}
 
 

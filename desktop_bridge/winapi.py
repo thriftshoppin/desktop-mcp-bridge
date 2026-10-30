@@ -1,4 +1,4 @@
-﻿"""Thin ctypes/pywin32 helpers: DPI awareness, monitors, session state, windows, SendInput, clipboard.
+"""Thin ctypes/pywin32 helpers: DPI awareness, monitors, session state, windows, SendInput, clipboard.
 
 Imports dxcam-free; safe to import early. Everything here uses physical pixels (per-monitor DPI v2).
 """
@@ -224,6 +224,20 @@ def list_top_windows(include_hidden_titles: bool = False) -> list[int]:
     return out
 
 
+def windows_by_pid() -> dict[int, list[dict]]:
+    """Every top-level window (visible or not), grouped by owning process id."""
+    out: dict[int, list[dict]] = {}
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def cb(h, _l):
+        h = int(h) if h else 0
+        out.setdefault(window_pid(h), []).append({"hwnd": h, "class": window_class(h), "visible": bool(user32.IsWindowVisible(wt.HWND(h)))})
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return out
+
+
 def focus_window(hwnd: int) -> bool:
     h = wt.HWND(hwnd)
     if user32.IsIconic(h):
@@ -335,8 +349,19 @@ def _key_input(vk: int, up: bool) -> _INPUT:
     return i
 
 
+LAST_OWN_ESC = [0.0]  # monotonic time of the bridge's own last injected Esc event (the Esc kill switch ignores presses right after it)
+
+
+def own_esc_age() -> float:
+    return time.monotonic() - LAST_OWN_ESC[0] if LAST_OWN_ESC[0] else 1e9
+
+
 def key_event(vk: int, up: bool) -> None:
+    if vk == 0x1B:
+        LAST_OWN_ESC[0] = time.monotonic()
     _send([_key_input(vk, up)])
+    if vk == 0x1B:
+        LAST_OWN_ESC[0] = time.monotonic()
 
 
 def press_combo(vks: list[int], hold_ms: int = 20, check: Callable[[], None] | None = None) -> None:
@@ -397,6 +422,25 @@ def cursor_pos() -> tuple[int, int]:
 
 def move_cursor(x: int, y: int) -> None:
     user32.SetCursorPos(int(x), int(y))
+
+
+def glide(x: int, y: int, ms_min: int = 120, ms_max: int = 300, check: Callable[[], None] | None = None) -> float:
+    """Move the REAL cursor to (x, y) with an eased glide (smoothstep), 120-300 ms scaled by distance. Returns duration in ms."""
+    sx, sy = cursor_pos()
+    dist = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
+    dur = min(ms_max, ms_min + dist * 0.12) / 1000.0
+    t0 = time.perf_counter()
+    while True:
+        if check:
+            check()
+        f = (time.perf_counter() - t0) / dur
+        if f >= 1.0:
+            break
+        e = f * f * (3 - 2 * f)
+        move_cursor(round(sx + (x - sx) * e), round(sy + (y - sy) * e))
+        time.sleep(0.008)
+    move_cursor(x, y)
+    return dur * 1000
 
 
 def mouse_click(button: str = "left", count: int = 1, gap_ms: int = 60, check: Callable[[], None] | None = None) -> None:
