@@ -202,6 +202,7 @@ class Bridge:
             "monitors": len(mons),
             "in_control": bool(self.control and self.control.in_control()),
             "client": self.client,
+            "client_role": "primary" if self.client == "Claude desktop" else "secondary",
             "clients": self.clients_fn(),
             "instance": self.instance,
             "idle_grace_s": self.control.grace if self.control else None,

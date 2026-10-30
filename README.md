@@ -14,22 +14,31 @@ call, every command it runs and its output, and every kill-switch event. Nothing
 ## How it is built
 
 ```
-Claude desktop  --stdio-->  launcher.py (Medium integrity, stdlib only, relays bytes)
-                               | 2 named pipes: user-only DACL, kernel-verified client PID, per-launch token
-                               v
-                      desktop_bridge.worker (ELEVATED, visible console)  -- MCP server (mcp 2.3.0 `MCPServer`)
-                         capture (dxcam/DXGI, mss fallback) - UI Automation - SendInput - clipboard - audio probe
-                         kill-switch hotkeys - queued action-log writer (Add-ClaudeLog.ps1)
+Claude desktop (Cowork) = PRIMARY client          Claude Code (VS Code) = optional second client
+        | stdio MCP                                      | stdio MCP
+   launcher.py (Medium, stdlib only, thin relay)    launcher.py (same file, same relay)
+        \_______ control pipe: user-only DACL, kernel-verified client PID ______/
+                                      v
+            THE GUARDIAN: one elevated worker per Windows session, one visible feed window  -- MCP server (mcp 2.3.0 `MCPServer`)
+              per-client sessions (own pipe pair + one-time token, own screenshot/element references)
+              ONE shared UI thread (input of all clients is serialized; the primary client goes first), overlay, two-stage Esc, hotkeys,
+              capture (DXGI, GDI fallback) - UI Automation - SendInput - clipboard - audio probe - queued action log
 ```
 
-* The launcher starts the worker with `ShellExecute runas`. On this PC UAC is **enabled with silent admin elevation**
-  (`ConsentPromptBehaviorAdmin=0`), so there is no prompt. If `runas` ever fails, the launcher falls back to the scheduled task
-  `DesktopBridgeWorker` (create it once with `install-elevated-task.ps1`).
-* The worker exits when the launcher disconnects or dies. No TCP/UDP port is opened.
-* Because the worker is elevated, input works in elevated windows (Task Manager, regedit, installers) and `desktop_run` /
-  `desktop_launch` run elevated. The `elevated` parameters are kept for compatibility and are effectively always true.
+* **One shared bridge, like a primary/relay setup:** the first launcher that finds no guardian starts it (silent `runas`, one visible window); every
+  later launcher, from any client, joins it. No extra feed windows or config prompts per client or session.
+* **Claude desktop is the primary client** (it is what most people use with this): its input goes first when two clients want the mouse or keyboard
+  at the same moment; other clients wait briefly (they are never refused for that). Every log line and `session_status` names the client.
+* **A client the guardian has never seen is not served until you allow it, once:** the feed window asks `Allow client 'Claude Code (VS Code)' ... (y/N)`;
+  the answer is remembered (state folder `%ProgramData%\DesktopBridge\state`, outside the packaged-app file redirection).
+* The guardian exits by itself after `guardian.idle_exit_min` (default 120) minutes without a client, or when you close its window. If `runas`
+  fails, the launcher falls back to the scheduled task `DesktopBridgeWorker` (create it once with `install-elevated-task.ps1`).
+* UAC on this PC is **enabled with silent elevation** (`ConsentPromptBehaviorAdmin=0`). The guardian is elevated, so input works in elevated windows and
+  `desktop_run`/`desktop_launch` run elevated (the `elevated` parameters are kept for compatibility).
 
 ## Install / register (you do this; the bridge never edits Claude's config)
+
+**Primary: Claude desktop (Cowork).** Optional second client: Claude Code (below).
 
 1. **Recommended first:** run `C:\Users\SysAdmin\Claude\log-tools\Protect-ClaudeLog.ps1` yourself so the actions log becomes
    append-only and audited. The bridge writes through `Add-ClaudeLog.ps1`, which only needs AppendData rights.
@@ -44,12 +53,17 @@ Claude desktop  --stdio-->  launcher.py (Medium integrity, stdlib only, relays b
 ```
 
    (Alternatively use the repo as a Claude plugin: `.claude-plugin/plugin.json` points at the same launcher.)
-3. On first use a console window titled **Desktop Bridge - live action feed** appears. Leave it open; closing it stops the worker.
+3. On first use a console window titled **Desktop Bridge - live action feed** appears. Leave it open; closing it stops the bridge for every client.
 4. Optional fallback if `runas` is ever refused: from an elevated PowerShell run `install-elevated-task.ps1` once.
+5. **Optional second client: Claude Code.** Register the same launcher in Claude Code's own MCP config (user scope), for example
+   `claude mcp add --scope user desktop -- <repo>/.venv/Scripts/python.exe <repo>/launcher.py`. It joins the same guardian (no new window); the first time, the feed
+   window asks once to allow it, and from then on its tool calls show up named `client=Claude Code (VS Code)`.
 
 Rebuild the environment: `python -m venv .venv` (Python 3.14.8 here) then `.venv\Scripts\python.exe -m pip install -r requirements.txt`.
 
 ## Kill switch
+
+**Esc is two-stage and applies to every client at once:** the first Esc **cancels every tool call that is running** (they return `CANCELLED_BY_USER`, the border turns yellow, the bridge stays usable); a **second Esc within 10 s** (`kill_switch.esc_second_press_s`), or an Esc while Claude is in control with nothing running, **stops the bridge** for everyone (border red, every call refused until you resume in the feed window).
 
 **Esc** (while Claude is in control; see below), `Ctrl+Alt+Pause` or `Ctrl+Alt+Shift+K` (combos configurable in `config.json`). The worker registers them itself, so they work even if the
 launcher or Claude hangs. (Hotkey plus a key-state poll, so it also works when no window has the foreground.) On trigger: in-flight waits, typing, clicks and `desktop_run` stop within about a second, every tool

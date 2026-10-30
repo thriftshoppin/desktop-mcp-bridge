@@ -17,6 +17,15 @@ import threading
 SCRIPT_HOSTS = {"python.exe", "pythonw.exe", "node.exe", "powershell.exe", "pwsh.exe", "cmd.exe"}
 
 
+# Claude desktop (Cowork) is the PRIMARY client: what most people use this bridge with. When two clients want the pointer or keyboard at the same
+# moment, the primary goes first and the others wait briefly (they are never refused for that).
+PRIMARY_LABELS = {"Claude desktop"}
+
+
+def is_primary(label: str) -> bool:
+    return label in PRIMARY_LABELS
+
+
 def norm_path(p: str) -> str:
     """Lower-case, forward slashes, version-like digit runs collapsed so updates (Claude_4.4212.0.0, claude-code-2.1.312) keep the identity."""
     p = (p or "").replace("\\", "/").lower()

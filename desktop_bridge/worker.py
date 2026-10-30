@@ -204,6 +204,13 @@ def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", 
                                       f"Last error: {log.last_error}")
                 B.ensure_feed_visible()
             controlled = gate and name not in control_mod.NO_CONTROL
+            if gate and name in control_mod.INPUT_TOOLS and not clients_mod.is_primary(B.client) and hub.primary_busy():
+                # the primary client (Claude desktop) goes first: wait for it (up to 8 s), never fight it for the mouse and keyboard
+                feed.put(f"{B.client}: waiting, Claude desktop is acting", "dim")
+                for _ in range(160):
+                    await asyncio.sleep(0.05)
+                    if not hub.primary_busy():
+                        break
             epoch = ks.epoch  # an Esc (stage 1) after this point cancels this call, even while it still waits for the UI thread
             cid = hub.add(B.client, name) if gate else None
 
@@ -423,6 +430,11 @@ class Hub:
 
     def count(self) -> int:
         return len(self.calls)
+
+    def primary_busy(self) -> int:
+        """In-flight INPUT calls of the primary client (Claude desktop)."""
+        with self.lock:
+            return sum(1 for c, n in self.calls.values() if clients_mod.is_primary(c) and n in control_mod.INPUT_TOOLS)
 
     def add_session(self, label: str) -> int:
         with self.lock:
