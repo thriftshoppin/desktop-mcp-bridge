@@ -982,7 +982,7 @@ async def main() -> int:
                  "password": steps_core[5], "kill_combos": steps_core[6], "fs": steps_core[7], "run_ui": steps_core[8], "audio": steps_core[9], "perf": steps_core[10],
                  "border": steps_control[0], "clickthrough": steps_control[1], "mouse": steps_control[2], "typing": steps_control[3], "esc": steps_control[4],
                  "self_protect": steps_control[5], "yield": steps_control[6], "visibility": steps_control[7]}
-        steps = [every["startup"]] + [every[n] for n in only if n in every and n != "startup"]
+        steps = [every[n] for n in only if n in every]
     if steps:
         async with open_session(env) as c:
             tools = [t.name for t in (await c.s.list_tools()).tools]
@@ -997,6 +997,14 @@ async def main() -> int:
                         pass
             if not only:
                 await t_log(c, since)
+    sess_only = [n for n in (only or []) if n in ("launcher_kill", "shared", "unknown")]
+    if sess_only:
+        fns = {"launcher_kill": lambda: t_launcher_kill(env), "shared": lambda: s_shared(env), "unknown": lambda: s_unknown_client(env)}
+        for n in sess_only:
+            try:
+                await fns[n]()
+            except Exception as e:
+                record("EXCEPTION in session test", False, f"{type(e).__name__}: {e}")
     if part in ("all", "sessions") and not only:
         await t_launcher_kill(env)
         for fn in (lambda: s_shared(env), lambda: s_unknown_client(env), lambda: s_overlay_fail(env), lambda: s_approval_pending(), lambda: s_injection(env)):
