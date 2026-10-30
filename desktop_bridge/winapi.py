@@ -443,13 +443,16 @@ class UserMoved(Exception):
     """The real cursor is not where the bridge put it: the user is using the mouse. Yield."""
 
 
-def glide(x: int, y: int, ms_min: int = 120, ms_max: int = 300, check: Callable[[], None] | None = None) -> float:
-    """Move the REAL cursor to (x, y) with an eased glide (smoothstep), 120-300 ms scaled by distance. Returns duration in ms."""
-    sx, sy = cursor_pos()
-    dist = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
+def glide(x: int, y: int, ms_min: int = 120, ms_max: int = 300, check: Callable[[], None] | None = None, rects: list | None = None) -> float:
+    """Move the REAL cursor to (x, y) with an eased glide (smoothstep), 120-300 ms scaled by distance, along a path that stays on the monitors
+    (through the edge shared with the next monitor, like a hand would). Raises UserMoved if the cursor is not where the glide put it."""
+    from .coords import path_length, plan_path, point_along
+    start = cursor_pos()
+    path = plan_path(start, (x, y), rects) if rects else [start, (x, y)]
+    dist = path_length(path)
     dur = min(ms_max, ms_min + dist * 0.12) / 1000.0
     t0 = time.perf_counter()
-    last = (sx, sy)
+    last = start
     while True:
         if check:
             check()
@@ -459,8 +462,7 @@ def glide(x: int, y: int, ms_min: int = 120, ms_max: int = 300, check: Callable[
         f = (time.perf_counter() - t0) / dur
         if f >= 1.0:
             break
-        e = f * f * (3 - 2 * f)
-        last = (round(sx + (x - sx) * e), round(sy + (y - sy) * e))
+        last = point_along(path, f * f * (3 - 2 * f))
         move_cursor(*last)
         time.sleep(0.008)
     move_cursor(x, y)

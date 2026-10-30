@@ -869,6 +869,13 @@ async def main() -> int:
     steps_control = [lambda c, tools: t_border(c), lambda c, tools: t_clickthrough(c), lambda c, tools: t_mouse(c), lambda c, tools: t_typing(c),
                      lambda c, tools: t_esc(c), lambda c, tools: t_self_protect(c), lambda c, tools: t_yield(c), lambda c, tools: t_visibility(c)]
     steps = (steps_core if part in ("all", "core") else []) + (steps_control if part in ("all", "control") else [])
+    only = next((x.split("=", 1)[1].split(",") for x in sys.argv[1:] if x.startswith("--only=")), None)
+    if only:  # e.g. --only=coords,elevated,password  (names are the step functions without the t_ prefix)
+        every = {"startup": steps_core[0], "coords": steps_core[1], "notepad": steps_core[2], "elevated": steps_core[3], "clipboard": steps_core[4],
+                 "password": steps_core[5], "kill_combos": steps_core[6], "fs": steps_core[7], "run_ui": steps_core[8], "audio": steps_core[9], "perf": steps_core[10],
+                 "border": steps_control[0], "clickthrough": steps_control[1], "mouse": steps_control[2], "typing": steps_control[3], "esc": steps_control[4],
+                 "self_protect": steps_control[5], "yield": steps_control[6], "visibility": steps_control[7]}
+        steps = [every["startup"]] + [every[n] for n in only if n in every and n != "startup"]
     if steps:
         async with open_session(env) as c:
             tools = [t.name for t in (await c.s.list_tools()).tools]
@@ -881,8 +888,9 @@ async def main() -> int:
                         await c.call("desktop_resume")
                     except Exception:
                         pass
-            await t_log(c, since)
-    if part in ("all", "sessions"):
+            if not only:
+                await t_log(c, since)
+    if part in ("all", "sessions") and not only:
         await t_launcher_kill(env)
         for fn in (lambda: s_overlay_fail(env), lambda: s_approval_pending(), lambda: s_injection(env)):
             try:

@@ -461,7 +461,7 @@ class Bridge:
         detail = ""
         for attempt in range(4):
             try:
-                return winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), guard)
+                return winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), guard, [m.rect for m in self.monitors()])
             except winapi.UserMoved as um:
                 detail = str(um)
                 self.say(f"you moved the mouse ({detail}): waiting for you to finish, then continuing", "yel")
