@@ -249,6 +249,9 @@ async def t_coords(c: Client):
 
 async def t_notepad(c: Client):
     name = "T06 Notepad round trip (launch, visible click+typing, ui_tree shows text, ctrl+s, fs read matches, close tab)"
+    if "--skip-notepad" in sys.argv:
+        record(name, None, "SKIPPED by --skip-notepad")
+        return
     if any((p.info["name"] or "").lower() == "notepad.exe" for p in psutil.process_iter(["name"])):
         record(name, None, "SKIPPED: Notepad is already running (the user's own tabs would be at risk). Close Notepad and run `selftest.py core` to include this check.")
         return
@@ -849,7 +852,7 @@ async def t_log(c: Client, since: str):
 
 
 async def main() -> int:
-    part = sys.argv[1] if len(sys.argv) > 1 else "all"
+    part = next((a for a in sys.argv[1:] if not a.startswith("--")), "all")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     store = make_store()
     env = {"DESKTOP_BRIDGE_APPROVAL_DIR": store}
