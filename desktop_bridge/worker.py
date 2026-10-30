@@ -35,6 +35,7 @@ from .safety import KillSwitch, LogWriter, ToolRefused
 
 import anyio
 import mcp_types as mt
+import psutil
 from mcp.server.mcpserver import MCPServer
 from mcp.server.stdio import stdio_server
 
@@ -566,14 +567,38 @@ def main() -> None:
         feed.put(f"overlay UNAVAILABLE - input tools will refuse: {overlay.error}", "red")
     prompt_lock = threading.Lock()
 
-    def ask_user(question: str) -> bool:
+    def ask_user(question: str, cancel=None) -> bool:
+        """Typed y/N in THIS console window (hardware keyboard; Medium processes cannot reach an elevated console). `cancel()` withdraws the
+        question when the asker has gone (e.g. the client that was waiting for the answer was closed), so no stale prompt keeps blocking."""
+        import msvcrt
         with prompt_lock:
             feed.put(question, "yel")
-            try:
-                ans = sys.stdin.readline()
-            except Exception:
-                return False
-            return ans.strip().lower() in ("y", "yes")
+            buf: list[str] = []
+            while True:
+                if cancel and cancel():
+                    feed.put("(the program that was waiting has gone: question withdrawn)", "dim")
+                    return False
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        break
+                    if ch in ("\x00", "\xe0"):  # arrow / function keys: swallow the second code
+                        msvcrt.getwch()
+                        continue
+                    if ch == "\x08":
+                        if buf:
+                            buf.pop()
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                        continue
+                    buf.append(ch)
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+                else:
+                    time.sleep(0.03)
+            return "".join(buf).strip().lower() in ("y", "yes")
 
     def resume_prompt_loop():
         while ks.lockout:
@@ -667,30 +692,37 @@ def main() -> None:
             feed.put(f"client disconnected: {label}; {hub.session_count()} client(s) left", "dim")
             log.log(f"client disconnected: {label} clients_now={hub.session_count()}")
 
-    pending = [0]
+    pending: dict[int, int] = {}   # control-connection id -> client pid (waiting for the user's 'Allow?' answer)
+    key_locks: dict[str, threading.Lock] = {}
+    pending_n = [0]
 
     def handle_control(h) -> None:
         import win32file
         import win32pipe
-        pending[0] += 1
+        pending_n[0] += 1
+        my_id = pending_n[0]
         try:
             pid = win32pipe.GetNamedPipeClientProcessId(h)
+            pending[my_id] = pid
             raw = win32file.ReadFile(h, 4096)[1]
             req = json.loads(raw.decode("utf-8", "replace").strip() or "{}")
             if req.get("op") != "connect" or int(req.get("pid", -1)) != pid:
                 reply = {"ok": False, "reason": "bad request (the claimed pid must equal the pipe client's pid)"}
             else:
                 client = clients_mod.find_client(pid)
-                if not allow.is_allowed(client["key"]):
-                    if ask_user(f"Allow client '{client['label']}' to use the bridge? (y/N)   program: {client['exe']}  {client['script']}   launcher pid {pid}"):
-                        allow.add(client["key"], client["label"], client["exe"])
-                        log.log(f"client allowed by the user via the feed window: {client['label']} key={client['key'][:12]}")
-                        feed.put(f"client '{client['label']}' is now allowed (remembered)", "grn")
-                    else:
-                        log.log(f"client refused by the user: {client['label']}")
-                        reply = {"ok": False, "reason": f"the user did not allow client '{client['label']}'"}
-                        win32file.WriteFile(h, (json.dumps(reply) + "\n").encode())
-                        return
+                with key_locks.setdefault(client["key"], threading.Lock()):  # two launchers of the same app => ONE question
+                    if not allow.is_allowed(client["key"]):
+                        yes = ask_user(f"Allow client '{client['label']}' to use the bridge? (y/N)   program: {client['exe']}  {client['script']}   launcher pid {pid}",
+                                       cancel=lambda: not psutil.pid_exists(pid))
+                        if yes:
+                            allow.add(client["key"], client["label"], client["exe"])
+                            log.log(f"client allowed by the user via the feed window: {client['label']} key={client['key'][:12]}")
+                            feed.put(f"client '{client['label']}' is now allowed (remembered)", "grn")
+                        else:
+                            log.log(f"client not allowed (refused or gone): {client['label']}")
+                            reply = {"ok": False, "reason": f"the user did not allow client '{client['label']}'"}
+                            win32file.WriteFile(h, (json.dumps(reply) + "\n").encode())
+                            return
                 pipe = "desktop-bridge-" + secrets.token_hex(16)
                 token = secrets.token_hex(24)
                 pin = _create_pipe(pipe + "-in", True)
@@ -704,7 +736,7 @@ def main() -> None:
             except Exception:
                 pass
         finally:
-            pending[0] -= 1
+            pending.pop(my_id, None)
             try:
                 win32file.FlushFileBuffers(h)
                 win32pipe.DisconnectNamedPipe(h)
@@ -741,7 +773,7 @@ def main() -> None:
         last = time.monotonic()
         while True:
             time.sleep(1)
-            if hub.session_count() > 0 or pending[0] > 0 or not approved_evt.is_set():
+            if hub.session_count() > 0 or any(psutil.pid_exists(p) for p in list(pending.values())) or not approved_evt.is_set():
                 last = time.monotonic()
             elif idle_s > 0 and time.monotonic() - last > idle_s:
                 shutdown(f"idle: no client for {idle_s:g} s")
