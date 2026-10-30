@@ -237,7 +237,8 @@ class Approval:
 
     def __init__(self, root: str, store_dir: str | None = None):
         self.root = root
-        self.dir = store_dir or os.path.join(os.environ.get("LOCALAPPDATA", root), "desktop-bridge")
+        # %ProgramData% is not redirected for packaged (MSIX) parents, unlike %LOCALAPPDATA%: the store stays in one place for every client
+        self.dir = store_dir or os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "DesktopBridge", "state")
         self.path = os.path.join(self.dir, "config.approved.json")
 
     def state(self) -> tuple[bool, list[str], str]:
@@ -253,6 +254,30 @@ class Approval:
             except Exception:
                 old = None
         return False, diff_summary(old, merged), digest
+
+    @staticmethod
+    def legacy_dirs() -> list[str]:
+        import glob
+        la = os.environ.get("LOCALAPPDATA", "")
+        return [os.path.join(la, "desktop-bridge")] + glob.glob(os.path.join(la, "Packages", "Claude_*", "LocalCache", "Local", "desktop-bridge"))
+
+    def import_legacy(self) -> str | None:
+        """One-time migration: if an earlier version recorded the user's approval of THIS exact config (same SHA-256) in the old location, adopt it.
+        Never imports an approval for a different config. Returns the source folder or None."""
+        digest, _ = config_digest(self.root)
+        for d in self.legacy_dirs():
+            p = os.path.join(d, "config.approved.json")
+            try:
+                with open(p, encoding="utf-8") as f:
+                    rec = json.load(f)
+            except Exception:
+                continue
+            if rec.get("sha256") == digest:
+                os.makedirs(self.dir, exist_ok=True)
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(rec, f, indent=1)
+                return d
+        return None
 
     def approve(self) -> None:
         digest, merged = config_digest(self.root)

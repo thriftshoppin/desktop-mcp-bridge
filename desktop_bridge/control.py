@@ -72,6 +72,14 @@ class Control:
             self.overlay.set_state("safety" if "injection" in source else "stopped")
             self.overlay.show()
 
+    def on_cancel(self, source: str) -> None:
+        """Stage 1 of Esc: yellow border, 'press Esc again to stop the bridge'. Reverts to orange after the second-press window."""
+        with self._lock:
+            self._last = time.monotonic()
+        if self.overlay.ok:
+            self.overlay.set_state("cancelled")
+            self.overlay.show()
+
     def on_resume(self) -> None:
         with self._lock:
             self._last = time.monotonic()
@@ -84,6 +92,9 @@ class Control:
             try:
                 if self.overlay.ok and self.overlay.visible and not self.ks.active and not self.in_control():
                     self.overlay.hide()
+                lc = self.ks.last_cancel
+                if self.overlay.ok and self.overlay.state == "cancelled" and not self.ks.active and (lc is None or time.monotonic() - lc > self.ks.second_press_s):
+                    self.overlay.set_state("active")
             except Exception:
                 pass
 

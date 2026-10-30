@@ -41,12 +41,15 @@ class Rec:
 
 
 class Bridge:
-    def __init__(self, cfg: dict, log: safety.LogWriter, ks: safety.KillSwitch):
+    def __init__(self, cfg: dict, log: safety.LogWriter, ks: safety.KillSwitch, cap=None, client: str = "", approved=None):
         self.cfg = cfg
         self.log = log
         self.ks = ks
         self.started = time.time()
-        self.cap = capture.Capturer()
+        self.cap = cap or capture.Capturer()   # shared between sessions in the guardian (one DXGI camera set)
+        self.client = client                   # who is on the other end of this MCP session (Claude desktop, Claude Code ...)
+        self.instance = "main"
+        self.clients_fn = lambda: []           # set by the guardian: labels of all connected clients
         self.refs = uia.RefTable()
         self.last_shot: coords.ShotContext | None = None
         self._mons: tuple[float, list[Monitor]] | None = None
@@ -55,11 +58,15 @@ class Bridge:
         self.blocked_combos = {c.replace(" ", "").lower() for c in cfg.get("blocked_combos", ["win+l"])}
         self.log_typed = bool(cfg.get("log", {}).get("log_typed_text", False))
         self.protected = [os.path.expandvars(p) for p in self.protected]
+        # built-in protection that does not depend on what config.json lists (nor on MSIX path redirection)
+        from . import config as _cfg
+        pd = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "DesktopBridge")
+        self.protected += [pd] + policy.Approval.legacy_dirs() + [os.path.join(_cfg.ROOT, n) for n in ("config.json", "config.local.json", "skills", "SECURITY.md", os.path.join("docs", "SECURITY.md"))]
         self.downloads_mode: str = cfg.get("downloads", "ask")
         self.overlay = None   # set by worker
         self.control = None   # set by worker
         self.say = lambda *a, **k: None  # set by worker: prints a line in the live feed window
-        self.approved = threading.Event()  # config.json approval (set by worker after the user answers in the feed window)
+        self.approved = approved or threading.Event()  # config.json approval (shared by all sessions; set after the user answers in the feed window)
         self.approval_info: dict = {}
 
     # ------------------------------------------------------------------ helpers
@@ -194,6 +201,9 @@ class Bridge:
             "foreground": {"hwnd": fg, "title": winapi.window_text(fg), "process": winapi.process_info(winapi.window_pid(fg))[0]} if fg else None,
             "monitors": len(mons),
             "in_control": bool(self.control and self.control.in_control()),
+            "client": self.client,
+            "clients": self.clients_fn(),
+            "instance": self.instance,
             "idle_grace_s": self.control.grace if self.control else None,
             "border_lead_ms_last": self.control.last_lead_ms if self.control else None,
             "overlay": {"ok": bool(self.overlay and self.overlay.ok), "visible": bool(self.overlay and self.overlay.visible),

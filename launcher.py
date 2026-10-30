@@ -1,14 +1,17 @@
-"""Desktop MCP Bridge launcher: the process Claude desktop starts (stdio MCP). Python stdlib only.
+"""Desktop MCP Bridge launcher: the process an MCP client (Claude desktop, Claude Code ...) starts (stdio MCP). Python stdlib only.
 
-It does no MCP work itself. It (1) starts the elevated worker (ShellExecute 'runas'; scheduled-task fallback), (2) connects to two
-user-only named pipes the worker creates, (3) proves the per-launch token, and (4) relays raw MCP bytes: stdin -> pipe, pipe -> stdout.
-When Claude closes our stdin, we close the pipes and the worker exits on its own.
+A thin relay, like the relay copies of a shared bridge: it does no MCP work itself. It
+  1. finds the ONE shared elevated guardian through its control pipe (and starts it, once, if it is not running: silent 'runas', visible window),
+  2. asks the guardian for a session (the guardian checks the kernel-reported PID of this process and, for a client it has never seen, asks the user
+     ONCE in the feed window to allow it),
+  3. connects to the per-session pipe pair it is handed and proves the one-time token,
+  4. relays raw MCP bytes: stdin -> pipe, pipe -> stdout.
+When the client closes our stdin the session ends; the guardian keeps running for the other clients.
 """
 import ctypes
 import ctypes.wintypes as wt
 import json
 import os
-import secrets
 import subprocess
 import sys
 import threading
@@ -17,6 +20,9 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SELF_PID = os.getpid()
 TASK_NAME = "DesktopBridgeWorker"
+INSTANCE = os.environ.get("DESKTOP_BRIDGE_INSTANCE", "main")
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.CreateMutexW.restype = wt.HANDLE
 
 
 def err(msg: str) -> None:
@@ -38,70 +44,102 @@ def is_admin() -> bool:
         return False
 
 
-def start_worker(pipe: str, token: str):
-    """Returns a process handle (int) or None. Raises RuntimeError when no way to start the elevated worker works."""
-    # VISIBLE by design: python.exe (console), shown in a normal window with the live action feed; never pythonw / SW_HIDE.
-    pythonw = sys.executable
-    plist = ["-m", "desktop_bridge.worker", "--pipe", pipe, "--token", token, "--launcher-pid", str(SELF_PID)]
-    if os.environ.get("DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL"):  # test hook; can only make the worker more restrictive
+def control_path() -> str:
+    return r"\\.\pipe" + "\\" + f"desktop-bridge-ctl-{INSTANCE}-{os.environ.get('USERNAME', 'user').lower()}"
+
+
+def start_guardian():
+    """Start the elevated guardian (visible console). Returns a process handle or None. Raises RuntimeError when it cannot be started."""
+    # VISIBLE by design: python.exe (console) with the live action feed; never pythonw / SW_HIDE.
+    py = sys.executable
+    plist = ["-m", "desktop_bridge.worker", "--guardian", "--instance", INSTANCE]
+    if os.environ.get("DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL"):  # test hook; can only make the guardian more restrictive
         plist.append("--force-overlay-fail")
-    if os.environ.get("DESKTOP_BRIDGE_APPROVAL_DIR"):  # test hook: use a different config-approval store (the real store stays untouched)
+    if os.environ.get("DESKTOP_BRIDGE_APPROVAL_DIR"):  # test hook: another state folder (config approval + client allow-list)
         plist += ["--approval-dir", os.environ["DESKTOP_BRIDGE_APPROVAL_DIR"]]
+    if os.environ.get("DESKTOP_BRIDGE_IDLE_EXIT_S"):  # test hook: guardian exits that many seconds after its last client
+        plist += ["--idle-exit-s", os.environ["DESKTOP_BRIDGE_IDLE_EXIT_S"]]
     params = subprocess.list2cmdline(plist)
     if is_admin():  # already elevated (e.g. started from an admin shell): no need for runas
         si = subprocess.STARTUPINFO()
         si.dwFlags = 1  # STARTF_USESHOWWINDOW
         si.wShowWindow = 4  # SW_SHOWNOACTIVATE
-        subprocess.Popen([pythonw] + plist, cwd=ROOT, creationflags=0x10, startupinfo=si)  # CREATE_NEW_CONSOLE
+        subprocess.Popen([py] + plist, cwd=ROOT, creationflags=0x10, startupinfo=si)  # CREATE_NEW_CONSOLE
         return None
     sei = SHELLEXECUTEINFOW()
     sei.cbSize = ctypes.sizeof(sei)
     sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
     sei.lpVerb = "runas"
-    sei.lpFile = pythonw
+    sei.lpFile = py
     sei.lpParameters = params
     sei.lpDirectory = ROOT
     sei.nShow = 4  # SW_SHOWNOACTIVATE: visible, but does not steal focus
     if ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
         return sei.hProcess
-    code = ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
+    code = ctypes.get_last_error() or k32.GetLastError()
     err(f"runas failed (error {code}); trying the scheduled-task fallback '{TASK_NAME}'")
-    hp = os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "desktop-bridge")
-    os.makedirs(hp, exist_ok=True)
-    path = os.path.join(hp, "handoff.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"pipe": pipe, "token": token, "pid": SELF_PID}, f)
     r = subprocess.run(["schtasks", "/run", "/tn", TASK_NAME], capture_output=True, text=True)
     if r.returncode != 0:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        raise RuntimeError(f"cannot start the elevated worker: runas error {code}; task '{TASK_NAME}' not runnable "
+        raise RuntimeError(f"cannot start the elevated guardian: runas error {code}; task '{TASK_NAME}' not runnable "
                            f"({(r.stderr or r.stdout).strip()[:120]}). Run install-elevated-task.ps1 once.")
     return None
 
 
-def worker_exited(h) -> int | None:
-    if not h:
+def try_open_control():
+    try:
+        return open(control_path(), "r+b", buffering=0)
+    except (FileNotFoundError, PermissionError, OSError):
         return None
-    if ctypes.windll.kernel32.WaitForSingleObject(h, 0) == 0:
-        code = wt.DWORD()
-        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
-        return code.value
-    return None
 
 
-def open_pipe(path: str, mode: str, h, deadline: float):
+def open_control(timeout: float = 60.0):
+    """Open the guardian's control pipe; start the guardian once if needed. A start lock keeps two launchers from starting two guardians."""
+    deadline = time.monotonic() + timeout
+    f = try_open_control()
+    if f:
+        return f
+    lock = k32.CreateMutexW(None, False, f"Local\\DesktopBridgeStart-{INSTANCE}")
+    got = False
+    try:
+        got = k32.WaitForSingleObject(lock, 45000) in (0, 0x80)  # WAIT_OBJECT_0 / WAIT_ABANDONED
+        f = try_open_control()  # another launcher may have started it while we waited for the lock
+        if f:
+            return f
+        start_guardian()
+        while time.monotonic() < deadline:
+            f = try_open_control()
+            if f:
+                return f
+            time.sleep(0.2)
+        raise RuntimeError("the guardian did not come up (control pipe never appeared); see its window or %TEMP%\\desktop-bridge\\worker-<pid>.log")
+    finally:
+        if got:
+            k32.ReleaseMutex(lock)
+        k32.CloseHandle(lock)
+
+
+def request_session():
+    ctl = open_control()
+    try:
+        ctl.write((json.dumps({"op": "connect", "pid": SELF_PID}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):  # blocks while the user answers a first-time 'Allow this client?' prompt in the feed window
+            ch = ctl.read(1)
+            if not ch:
+                break
+            buf += ch
+        return json.loads(buf.decode() or "{}")
+    finally:
+        ctl.close()
+
+
+def open_pipe(path: str, mode: str, deadline: float):
     last = None
     while time.monotonic() < deadline:
         try:
             return open(path, mode, buffering=0)
         except (FileNotFoundError, PermissionError, OSError) as e:
             last = e
-        code = worker_exited(h)
-        if code is not None:
-            raise RuntimeError(f"worker exited early (code {code}); see %TEMP%\\desktop-bridge\\worker-<pid>.log")
         time.sleep(0.1)
     raise RuntimeError(f"could not open {path}: {last}")
 
@@ -114,22 +152,23 @@ def write_all(f, data: bytes) -> None:
 
 
 def main() -> int:
-    pipe = "desktop-bridge-" + secrets.token_hex(16)
-    token = secrets.token_hex(24)
     try:
-        h = start_worker(pipe, token)
+        resp = request_session()
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("reason") or "the guardian refused the connection")
+        pipe, token = resp["pipe"], resp["token"]
         deadline = time.monotonic() + 40
-        pin = open_pipe(r"\\.\pipe" + "\\" + pipe + "-in", "wb", h, deadline)
-        pout = open_pipe(r"\\.\pipe" + "\\" + pipe + "-out", "rb", h, deadline)
+        pin = open_pipe(r"\\.\pipe" + "\\" + pipe + "-in", "wb", deadline)
+        pout = open_pipe(r"\\.\pipe" + "\\" + pipe + "-out", "rb", deadline)
         write_all(pin, f"HELLO {token}\n".encode("ascii"))
         reply = b""
         while not reply.endswith(b"\n") and len(reply) < 16:
             ch = pout.read(1)
             if not ch:
-                raise RuntimeError("worker closed the pipe during the handshake")
+                raise RuntimeError("guardian closed the pipe during the handshake")
             reply += ch
         if reply.strip() != b"OK":
-            raise RuntimeError("handshake rejected by worker")
+            raise RuntimeError("handshake rejected by the guardian")
     except Exception as e:
         err(str(e))
         return 1

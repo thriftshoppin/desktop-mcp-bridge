@@ -77,11 +77,13 @@ WDA_EXCLUDEFROMCAPTURE = 0x11
 ORANGE = 0x00008CFF  # COLORREF 0x00BBGGRR for #FF8C00
 RED = 0x001E1EDC     # #DC1E1E
 DARK = 0x00181818
+YELLOW = 0x0000C8FF  # #FFC800: stage 1 of Esc (cancelled), a second Esc stops the bridge
 
 LABELS = {
     "active": "Claude is using your computer · Esc to stop",
     "stopped": "Stopped by you",
     "safety": "Stopped for safety · see the feed window",
+    "cancelled": "Cancelled · press Esc again to stop the bridge",
 }
 
 
@@ -123,7 +125,7 @@ class Overlay:
         self._halo: dict | None = None
         self._halo_anim: tuple[float, int, int] | None = None  # (start, x, y)
         self._mons: list = []
-        self._brush = {"orange": None, "red": None}
+        self._brush = {"orange": None, "red": None, "yellow": None}
         self._font_cache: dict[int, int] = {}
         self._cls = "DesktopBridgeOverlay"
         self._wndproc = WNDPROC(self._proc)
@@ -161,6 +163,10 @@ class Overlay:
         if self.ok:
             self._cmd("hide")
 
+    @property
+    def state(self) -> str:
+        return self._state
+
     def set_state(self, state: str) -> None:
         self._state = state
         if self.ok:
@@ -188,6 +194,7 @@ class Overlay:
             self._register()
             self._brush["orange"] = g32.CreateSolidBrush(ORANGE)
             self._brush["red"] = g32.CreateSolidBrush(RED)
+            self._brush["yellow"] = g32.CreateSolidBrush(YELLOW)
             self._build()
             self.ok = True
         except Exception as e:  # noqa
@@ -361,7 +368,7 @@ class Overlay:
             hdc = u32.BeginPaint(hwnd, ps)
             rc = wt.RECT()
             u32.GetClientRect(hwnd, ctypes.byref(rc))
-            col = "orange" if self._state == "active" else "red"
+            col = {"active": "orange", "cancelled": "yellow"}.get(self._state, "red")
             u32.FillRect(hdc, ctypes.byref(rc), self._brush[col])
             if w and w["kind"] == "pill":
                 s = _scale(w["mon"].dpi)
@@ -370,7 +377,7 @@ class Overlay:
                     self._font_cache[key] = g32.CreateFontW(-key, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
                 old = g32.SelectObject(hdc, self._font_cache[key])
                 g32.SetBkMode(hdc, 1)
-                g32.SetTextColor(hdc, 0x00101010 if self._state == "active" else 0x00FFFFFF)
+                g32.SetTextColor(hdc, 0x00101010 if self._state in ("active", "cancelled") else 0x00FFFFFF)
                 u32.DrawTextW(hdc, LABELS.get(self._state, LABELS["active"]), -1, ctypes.byref(rc), 0x1 | 0x4 | 0x20)  # CENTER|VCENTER|SINGLELINE
                 g32.SelectObject(hdc, old)
             u32.EndPaint(hwnd, ps)

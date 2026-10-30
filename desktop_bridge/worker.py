@@ -1,8 +1,9 @@
-"""Elevated worker: owns capture, input, UIA, audio, kill switch and the log queue; serves MCP over two named pipes.
+"""The guardian: ONE elevated worker per Windows session, shared by every Claude client (Claude desktop / Cowork, Claude Code ...).
 
-Started by launcher.py (ShellExecute runas, or the scheduled-task fallback). Accepts exactly one client: the launcher PID
-passed on the command line, verified by the kernel (GetNamedPipeClientProcessId), plus a per-launch token. It exits when the
-launcher disconnects or dies. No TCP/UDP listener anywhere.
+It owns capture, input, UIA, audio, the overlay, the feed window, the kill switch (two-stage Esc) and the log queue. Launchers are thin
+relays (like the Firefox bridge's relay copies): a launcher asks the control pipe for a session; the guardian checks the kernel-reported
+client PID, identifies the program that started the launcher, asks the user ONCE (typed in the feed window) to allow an unknown client,
+then hands out a fresh per-session pipe pair + one-time token (per-session handshake unchanged). No TCP/UDP listener anywhere.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 # dxcam/comtypes BEFORE any audio lib (COM init order); capture.py imports dxcam at import time.
 from . import capture  # noqa: F401  (first on purpose)
 from . import config as config_mod
+from . import clients as clients_mod
 from . import control as control_mod
 from . import mcp_patch
 from . import policy, safety, tools, winapi
@@ -54,7 +56,7 @@ class Feed:
         except Exception:
             pass
         try:
-            winapi.kernel32.SetConsoleTitleW("Desktop Bridge - live action feed (close this window to stop the worker)")
+            winapi.kernel32.SetConsoleTitleW("Desktop Bridge - live action feed (close this window to stop the bridge for every client)")
             hin = winapi.kernel32.GetStdHandle(-10)
             mode = ctypes.c_uint()
             winapi.kernel32.GetConsoleMode(hin, ctypes.byref(mode))
@@ -171,9 +173,8 @@ def _watch_launcher(pid: int, on_exit) -> None:
 
 # ----------------------------------------------------------------------------- MCP server
 
-def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", ctl: "control_mod.Control", on_injection=None):
-    ui = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ui", initializer=_init_ui)
-    misc = ThreadPoolExecutor(max_workers=6, thread_name_prefix="misc")
+def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", ctl: "control_mod.Control", hub: "Hub", on_injection=None):
+    ui, misc = _executors()  # shared by all sessions: one UI thread serializes every client's input
     server = MCPServer(SERVER_NAME, instructions=(
         "Desktop control for this Windows PC (screen, UI Automation, keyboard/mouse, clipboard, files, shell, audio level). "
         "Typical loop: desktop_screenshot -> desktop_ui_tree / desktop_find -> desktop_click / desktop_type / desktop_key. "
@@ -203,8 +204,13 @@ def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", 
                                       f"Last error: {log.last_error}")
                 B.ensure_feed_visible()
             controlled = gate and name not in control_mod.NO_CONTROL
+            epoch = ks.epoch  # an Esc (stage 1) after this point cancels this call, even while it still waits for the UI thread
+            cid = hub.add(B.client, name) if gate else None
 
             def runner():
+                ks.begin_call(epoch)
+                if gate:
+                    ks.check()
                 if controlled:
                     ctl.begin(name, name in control_mod.INPUT_TOOLS)
                 try:
@@ -213,7 +219,10 @@ def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", 
                     if controlled:
                         ctl.end()
 
-            out = await loop.run_in_executor(pool, runner)
+            try:
+                out = await loop.run_in_executor(pool, runner)
+            finally:
+                hub.remove(cid)
             if isinstance(out, tuple):
                 result, data, fmt = out
                 image = (data, fmt)
@@ -248,7 +257,7 @@ def build_server(B: tools.Bridge, log: LogWriter, ks: KillSwitch, feed: "Feed", 
                     rec.note += f" weak-signals={weak}"
                     feed.put(f"weak injection-like wording in {name} output: {weak} (labelled, not locked)", "yel")
         ms = round((time.perf_counter() - t0) * 1000)
-        line = f"{name} target={rec.target or '-'} {_fmt_args(rec.args)} -> {status}{(' ' + rec.note) if rec.note else ''} ({ms} ms)"
+        line = f"{name} target={rec.target or '-'} {_fmt_args(rec.args)} -> {status}{(' ' + rec.note) if rec.note else ''} ({ms} ms) client={B.client}"
         log.log(line)
         feed.put(line, "grn" if status == "OK" else "red" if "KILL" in status else "yel")
         for extra in rec.show:
@@ -393,33 +402,96 @@ def _init_ui() -> None:
     auto.InitializeUIAutomationInCurrentThread()
 
 
-# ----------------------------------------------------------------------------- main
+class Hub:
+    """Shared across all sessions of the guardian: in-flight calls (for Esc stage 1) and connected clients."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.calls: dict[int, tuple[str, str]] = {}
+        self.sessions: dict[int, str] = {}
+        self._n = 0
+
+    def add(self, client: str, name: str) -> int:
+        with self.lock:
+            self._n += 1
+            self.calls[self._n] = (client, name)
+            return self._n
+
+    def remove(self, cid: int | None) -> None:
+        with self.lock:
+            self.calls.pop(cid, None)
+
+    def count(self) -> int:
+        return len(self.calls)
+
+    def add_session(self, label: str) -> int:
+        with self.lock:
+            self._n += 1
+            self.sessions[self._n] = label
+            return self._n
+
+    def remove_session(self, sid: int) -> None:
+        with self.lock:
+            self.sessions.pop(sid, None)
+
+    def session_count(self) -> int:
+        return len(self.sessions)
+
+    def labels(self) -> list[str]:
+        with self.lock:
+            return sorted(self.sessions.values())
+
+
+_EX: dict = {}
+_EX_LOCK = threading.Lock()
+
+
+def _executors():
+    """ONE ui thread and one misc pool for the whole guardian: every client's input is serialized through the same UI thread."""
+    with _EX_LOCK:
+        if not _EX:
+            _EX["ui"] = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ui", initializer=_init_ui)
+            _EX["misc"] = ThreadPoolExecutor(max_workers=8, thread_name_prefix="misc")
+        return _EX["ui"], _EX["misc"]
+
+
+def _create_ctl_pipe(name: str, first: bool):
+    import win32pipe
+    mode = win32pipe.PIPE_ACCESS_DUPLEX | (0x00080000 if first else 0)
+    return win32pipe.CreateNamedPipe(r"\\.\pipe" + "\\" + name, mode, win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT | 0x8,
+                                     255, 65536, 65536, 0, _make_sd())
+
+
+def control_pipe_name(instance: str) -> str:
+    return f"desktop-bridge-ctl-{instance}-{os.environ.get('USERNAME', 'user').lower()}"
+
+
+# ----------------------------------------------------------------------------- main (the guardian)
 
 def main() -> None:
+    import secrets
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pipe")
-    ap.add_argument("--token")
-    ap.add_argument("--launcher-pid", type=int)
-    ap.add_argument("--approval-dir", default=None, help="test hook: config-approval store directory (default: the desktop-bridge folder under LOCALAPPDATA)")
+    ap.add_argument("--guardian", action="store_true", help="(default mode) shared guardian: one elevated worker serving every client")
+    ap.add_argument("--instance", default="main", help="instance name (tests use their own so they never touch the user's guardian)")
+    ap.add_argument("--idle-exit-s", type=float, default=0, help="test hook: exit this many seconds after the last client left (default: config guardian.idle_exit_min)")
+    ap.add_argument("--approval-dir", default=None, help="test hook: state folder (config approval + client allow-list); default %ProgramData%\\DesktopBridge\\state")
     ap.add_argument("--force-overlay-fail", action="store_true", help="test hook: make overlay creation fail (can only make the bridge MORE restrictive)")
-    ap.add_argument("--handoff", action="store_true", help="read pipe/token/pid from the per-user handoff file (scheduled-task start)")
     args = ap.parse_args()
     mcp_patch.apply()
     cfg = config_mod.load()
     feed = Feed(cfg)
     winapi.set_dpi_aware()
-    if args.handoff:
-        hp = os.path.join(os.environ["LOCALAPPDATA"], "desktop-bridge", "handoff.json")
-        with open(hp, "r", encoding="utf-8") as f:
-            h = json.load(f)
-        try:
-            safety.recycle(hp)
-        except Exception:
-            os.remove(hp)
-        args.pipe, args.token, args.launcher_pid = h["pipe"], h["token"], int(h["pid"])
-    if not (args.pipe and args.token and args.launcher_pid):
-        print("missing --pipe/--token/--launcher-pid", file=sys.stderr)
-        os._exit(2)
+    instance = args.instance
+
+    import win32api
+    import win32event
+    import winerror
+    mutex = win32event.CreateMutex(None, False, f"Local\\DesktopBridgeGuardian-{instance}")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        feed.put("another Desktop Bridge guardian is already running for this user: this window closes.", "yel")
+        time.sleep(0.8)
+        os._exit(0)
+    HOLD["mutex"] = mutex
 
     log = LogWriter(cfg["log"])
     stopping = threading.Event()
@@ -429,31 +501,44 @@ def main() -> None:
             return
         stopping.set()
         try:
-            log.log(f"desktop-bridge worker stopping: {reason}")
-            feed.put(f"worker stopping: {reason}", "yel")
+            log.log(f"desktop-bridge guardian stopping: {reason}")
+            feed.put(f"guardian stopping: {reason}", "yel")
             time.sleep(0.3)
             log.close()
         finally:
             os._exit(code)
 
+    hub = Hub()
     ctl_box: dict = {}
+    second = float(cfg.get("kill_switch", {}).get("esc_second_press_s", 10))
 
     def on_trip(src):
-        log.log(f"KILL source={src}; all tools refuse until resume")
+        log.log(f"KILL source={src}; all tools refuse until resume (every client)")
         who = "Stopped by you" if src == "esc" or src.startswith(("hotkey", "key state")) else "Stopped for safety"
-        feed.put(f"*** KILL SWITCH ({src}): {who}. Every tool refuses until resume. ***", "red")
+        feed.put(f"*** KILL SWITCH ({src}): {who}. Every tool of every client refuses until resume. ***", "red")
         winapi.user32.MessageBeep(0x30)
         if ctl_box.get("ctl"):
             ctl_box["ctl"].on_trip(src)
 
-    ks = KillSwitch(cfg["kill_switch"]["hotkeys"], on_trip=on_trip, in_control=lambda: bool(ctl_box.get("ctl") and ctl_box["ctl"].in_control()))
+    def on_cancel(src):
+        n = hub.count()
+        log.log(f"ESC stage 1 ({src}): cancelled {n} in-flight call(s) of all clients; Esc again within {second:g}s stops the bridge")
+        feed.put(f"ESC (1/2): cancelled {n} in-flight call(s) of every client. Press Esc again within {second:g} s to STOP the bridge.", "yel")
+        winapi.user32.MessageBeep(0x10)
+        if ctl_box.get("ctl"):
+            ctl_box["ctl"].on_cancel(src)
+
+    ks = KillSwitch(cfg["kill_switch"]["hotkeys"], on_trip=on_trip, in_control=lambda: bool(ctl_box.get("ctl") and ctl_box["ctl"].in_control()),
+                    inflight=hub.count, on_cancel=on_cancel, second_press_s=second)
     overlay = Overlay(cfg.get("overlay"), force_fail=args.force_overlay_fail)
     overlay_ok = overlay.start()
     ctl = control_mod.Control(cfg, overlay, ks, feed.put)
     ctl_box["ctl"] = ctl
-    B = tools.Bridge(cfg, log, ks)
-    B.overlay, B.control, B.say = overlay, ctl, feed.put
-    B.place_feed()
+    cap = capture.Capturer()
+    approved_evt = threading.Event()
+    base = tools.Bridge(cfg, log, ks, cap=cap, client="guardian", approved=approved_evt)
+    base.overlay, base.control, base.say = overlay, ctl, feed.put
+    base.place_feed()
     if overlay_ok:
         feed.put(f"overlay (orange border + halo) ready; excluded from screenshots: {overlay.affinity_ok}", "grn")
     else:
@@ -494,8 +579,14 @@ def main() -> None:
 
     appr = policy.Approval(config_mod.ROOT, args.approval_dir)
     ok_cfg, diff_lines, digest = appr.state()
+    if not ok_cfg:
+        src = appr.import_legacy()
+        if src:
+            feed.put(f"your earlier approval of this exact config was carried over from {src}", "dim")
+            log.log(f"config approval of sha256 {digest[:12]} imported from the legacy store {src}")
+            ok_cfg, diff_lines, digest = appr.state()
     if ok_cfg:
-        B.approved.set()
+        approved_evt.set()
         feed.put("config.json matches the version you last approved.", "dim")
     else:
         feed.put("config.json is NEW or CHANGED since you last approved it. Changes:", "red")
@@ -503,10 +594,10 @@ def main() -> None:
             feed.put("    " + ln, "yel")
 
         def approve_loop():
-            while not B.approved.is_set():
+            while not approved_evt.is_set():
                 if ask_user("Approve changed config? (y/N)  -- no tool works until you answer"):
                     appr.approve()
-                    B.approved.set()
+                    approved_evt.set()
                     log.log(f"config.json approved by the user via the feed window (sha256 {digest[:12]})")
                     feed.put("config approved", "grn")
 
@@ -515,34 +606,124 @@ def main() -> None:
         n = safety.clear_old_temp(cfg["temp_dir"], float(cfg.get("retention_hours", 24)))
     except Exception:
         n = 0
-    log.log(f"desktop-bridge worker started pid={os.getpid()} elevated={winapi.is_elevated()} integrity={winapi.integrity_level()} "
-            f"launcher_pid={args.launcher_pid} hotkeys={ks.status()['hotkeys']} temp_cleared={n}")
+    allow = clients_mod.AllowList(appr.dir)
+    ctl_name = control_pipe_name(instance)
+    log.log(f"desktop-bridge guardian started instance={instance} pid={os.getpid()} elevated={winapi.is_elevated()} integrity={winapi.integrity_level()} "
+            f"hotkeys={ks.status()['hotkeys']} state_dir={appr.dir} allowed_clients={len(allow.entries())} temp_cleared={n}")
+    feed.put("Desktop Bridge guardian - one shared bridge for every Claude on this PC. Everything any client does appears here (and in the actions log).", "grn")
+    feed.put(f"pid {os.getpid()}  instance {instance}  elevated={winapi.is_elevated()}  integrity={winapi.integrity_level()}  Esc: cancel the call, Esc again: stop the bridge  | hotkeys: {' / '.join(ks.combos)}", "dim")
 
-    pin = _create_pipe(args.pipe + "-in", True)
-    pout = _create_pipe(args.pipe + "-out", False)
-    threading.Thread(target=_watch_launcher, args=(args.launcher_pid, lambda why: shutdown(why)), daemon=True).start()
-    try:
-        rin, wout = _accept(pin, pout, args.launcher_pid, args.token)
-    except Exception as e:
-        shutdown(f"handshake failed: {e}", 3)
-        return
-    feed.put("Desktop Bridge worker - everything Claude does through it appears here (and in the actions log).", "grn")
-    feed.put(f"pid {os.getpid()}  elevated={winapi.is_elevated()}  integrity={winapi.integrity_level()}  kill switch: {' / '.join(ks.combos)}", "dim")
-    server = build_server(B, log, ks, feed, ctl, on_injection)
+    def serve_session(pin, pout, launcher_pid: int, token: str, client: dict) -> None:
+        label = client["label"]
+        sid = hub.add_session(label)
+        try:
+            rin, wout = _accept(pin, pout, launcher_pid, token)
+        except Exception as e:
+            feed.put(f"client '{label}' did not complete the handshake: {e}", "yel")
+            log.log(f"client {label} handshake failed: {e}")
+            hub.remove_session(sid)
+            return
+        feed.put(f"client connected: {label} (launcher pid {launcher_pid}); {hub.session_count()} client(s) now", "grn")
+        log.log(f"client connected: {label} launcher_pid={launcher_pid} clients_now={hub.session_count()}")
+        B = tools.Bridge(cfg, log, ks, cap=cap, client=label, approved=approved_evt)
+        B.overlay, B.control, B.say = overlay, ctl, feed.put
+        B.instance, B.clients_fn = instance, hub.labels
+        server = build_server(B, log, ks, feed, ctl, hub, on_injection)
+        stdin = anyio.wrap_file(io.TextIOWrapper(rin, encoding="utf-8", newline="\n"))
+        stdout = anyio.wrap_file(io.TextIOWrapper(wout, encoding="utf-8", newline="\n", write_through=True))
 
-    stdin = anyio.wrap_file(io.TextIOWrapper(rin, encoding="utf-8", newline="\n"))
-    stdout = anyio.wrap_file(io.TextIOWrapper(wout, encoding="utf-8", newline="\n", write_through=True))
+        async def serve():
+            async with stdio_server(stdin=stdin, stdout=stdout) as (r, w):
+                await server._lowlevel_server.run(r, w, server._lowlevel_server.create_initialization_options())
 
-    async def serve():
-        async with stdio_server(stdin=stdin, stdout=stdout) as (r, w):
-            await server._lowlevel_server.run(r, w, server._lowlevel_server.create_initialization_options())
+        try:
+            anyio.run(serve)
+        except BaseException as e:  # noqa
+            print(traceback.format_exc(), file=sys.stderr)
+            log.log(f"client {label} session error {type(e).__name__}: {str(e)[:120]}")
+        finally:
+            hub.remove_session(sid)
+            feed.put(f"client disconnected: {label}; {hub.session_count()} client(s) left", "dim")
+            log.log(f"client disconnected: {label} clients_now={hub.session_count()}")
 
-    try:
-        anyio.run(serve)
-        shutdown("launcher disconnected (MCP stream closed)")
-    except BaseException as e:  # noqa
-        print(traceback.format_exc(), file=sys.stderr)
-        shutdown(f"server error {type(e).__name__}: {str(e)[:120]}", 1)
+    def handle_control(h) -> None:
+        import win32file
+        import win32pipe
+        try:
+            pid = win32pipe.GetNamedPipeClientProcessId(h)
+            raw = win32file.ReadFile(h, 4096)[1]
+            req = json.loads(raw.decode("utf-8", "replace").strip() or "{}")
+            if req.get("op") != "connect" or int(req.get("pid", -1)) != pid:
+                reply = {"ok": False, "reason": "bad request (the claimed pid must equal the pipe client's pid)"}
+            else:
+                client = clients_mod.find_client(pid)
+                if not allow.is_allowed(client["key"]):
+                    if ask_user(f"Allow client '{client['label']}' to use the bridge? (y/N)   program: {client['exe']}  {client['script']}   launcher pid {pid}"):
+                        allow.add(client["key"], client["label"], client["exe"])
+                        log.log(f"client allowed by the user via the feed window: {client['label']} key={client['key'][:12]}")
+                        feed.put(f"client '{client['label']}' is now allowed (remembered)", "grn")
+                    else:
+                        log.log(f"client refused by the user: {client['label']}")
+                        reply = {"ok": False, "reason": f"the user did not allow client '{client['label']}'"}
+                        win32file.WriteFile(h, (json.dumps(reply) + "\n").encode())
+                        return
+                pipe = "desktop-bridge-" + secrets.token_hex(16)
+                token = secrets.token_hex(24)
+                pin = _create_pipe(pipe + "-in", True)
+                pout = _create_pipe(pipe + "-out", False)
+                threading.Thread(target=serve_session, args=(pin, pout, pid, token, client), name="session", daemon=True).start()
+                reply = {"ok": True, "pipe": pipe, "token": token, "client": client["label"]}
+            win32file.WriteFile(h, (json.dumps(reply) + "\n").encode())
+        except Exception as e:
+            try:
+                win32file.WriteFile(h, (json.dumps({"ok": False, "reason": f"{type(e).__name__}: {e}"[:200]}) + "\n").encode())
+            except Exception:
+                pass
+        finally:
+            try:
+                win32file.FlushFileBuffers(h)
+                win32pipe.DisconnectNamedPipe(h)
+            except Exception:
+                pass
+            try:
+                import win32api as _w
+                _w.CloseHandle(h)
+            except Exception:
+                pass
+
+    def control_loop() -> None:
+        import win32pipe
+        first = True
+        while True:
+            h = _create_ctl_pipe(ctl_name, first)
+            first = False
+            try:
+                win32pipe.ConnectNamedPipe(h, None)
+            except Exception as e:
+                if getattr(e, "winerror", None) != 535:  # ERROR_PIPE_CONNECTED: the client was already there, fine
+                    try:
+                        import win32api as _w
+                        _w.CloseHandle(h)
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    continue
+            threading.Thread(target=handle_control, args=(h,), name="control", daemon=True).start()
+
+    idle_s = args.idle_exit_s or float(cfg.get("guardian", {}).get("idle_exit_min", 120)) * 60
+
+    def idle_watch() -> None:
+        last = time.monotonic()
+        while True:
+            time.sleep(1)
+            if hub.session_count() > 0 or not approved_evt.is_set():
+                last = time.monotonic()
+            elif idle_s > 0 and time.monotonic() - last > idle_s:
+                shutdown(f"idle: no client for {idle_s:g} s")
+
+    threading.Thread(target=control_loop, name="control-loop", daemon=True).start()
+    threading.Thread(target=idle_watch, name="idle-watch", daemon=True).start()
+    threading.Event().wait()
 
 
 if __name__ == "__main__":

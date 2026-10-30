@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Callable
 
+from . import esc as esc_mod
+
 
 class ToolRefused(Exception):
     """Raised by a tool to return a clean {ok:false,error:{code,message}} to the client."""
@@ -170,12 +172,19 @@ class KillSwitchActive(ToolRefused):
         super().__init__("KILL_SWITCH", f"Kill switch is active (source: {source}). STOP, tell the user what you were doing.{extra}")
 
 
+class CancelledByUser(ToolRefused):
+    def __init__(self, second_press_s: float):
+        super().__init__("CANCELLED_BY_USER", "The user pressed Esc: this tool call was cancelled (first stage). The bridge is still available. "
+                         f"If the user presses Esc again within {second_press_s:g} s the whole bridge stops. Stop what you were doing, tell the user, and ask before retrying.")
+
+
 class KillSwitch:
     """Stops everything. Triggers: Esc (only while Claude is 'in control'; polled, never hooked or registered, so the key
     always reaches the foreground app), the two combos (RegisterHotKey + key-state poll), and the injection gate (lockout)."""
 
     def __init__(self, hotkeys: list[str], on_trip: Callable[[str], None] | None = None,
-                 in_control: Callable[[], bool] | None = None, esc_enabled: bool = True):
+                 in_control: Callable[[], bool] | None = None, esc_enabled: bool = True,
+                 inflight: Callable[[], int] | None = None, on_cancel: Callable[[str], None] | None = None, second_press_s: float = 10.0):
         from .winapi import MODIFIERS, VK, user32  # noqa
         self._user32 = user32
         self.combos = hotkeys
@@ -189,6 +198,12 @@ class KillSwitch:
         self._on_trip = on_trip
         self._in_control = in_control or (lambda: False)
         self.esc_enabled = esc_enabled
+        self._inflight = inflight or (lambda: 0)
+        self._on_cancel = on_cancel
+        self.second_press_s = float(second_press_s)
+        self.epoch = 0                      # bumped by every stage-1 cancel; calls remember the epoch they started in
+        self.last_cancel: float | None = None
+        self._tls = threading.local()
         self._cancel: list[Callable[[], None]] = []
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._loop, name="kill-hotkeys", daemon=True)
@@ -200,6 +215,38 @@ class KillSwitch:
     def check(self) -> None:
         if self.active:
             raise KillSwitchActive(self.since, self.source, self.lockout)
+        ep = getattr(self._tls, "epoch", None)
+        if ep is not None and ep != self.epoch:
+            raise CancelledByUser(self.second_press_s)
+
+    def begin_call(self, epoch: int) -> None:
+        """Remember (on this worker thread) the cancel epoch the call was admitted in; a later stage-1 cancel makes check() raise."""
+        self._tls.epoch = epoch
+
+    def cancel(self, source: str) -> None:
+        """Stage 1: cancel every in-flight call (all clients). The bridge stays available."""
+        with self._lock:
+            self.epoch += 1
+            self.last_cancel = time.monotonic()
+            cancels = list(self._cancel)
+        for fn in cancels:
+            try:
+                fn()
+            except Exception:
+                pass
+        if self._on_cancel:
+            try:
+                self._on_cancel(source)
+            except Exception:
+                pass
+
+    def esc_pressed(self) -> str:
+        action = esc_mod.decide(time.monotonic(), self._inflight(), self.last_cancel, self.second_press_s)
+        if action == "cancel":
+            self.cancel("esc")
+        else:
+            self.trip("esc")
+        return action
 
     def add_cancel(self, fn: Callable[[], None]) -> Callable[[], None]:
         with self._lock:
@@ -248,7 +295,8 @@ class KillSwitch:
 
     def status(self) -> dict:
         return {"active": self.active, "source": self.source, "lockout": self.lockout, "since": self.since or None, "trips": self.trips,
-                "esc": {"enabled": self.esc_enabled, "armed": bool(self.esc_enabled and self._in_control())},
+                "esc": {"enabled": self.esc_enabled, "armed": bool(self.esc_enabled and self._in_control()),
+                        "stage": esc_mod.stage(time.monotonic(), self.last_cancel, self.second_press_s, self.active), "second_press_s": self.second_press_s},
                 "hotkeys": {c: self.registered.get(c, False) for c in self.combos}, "errors": self.errors}
 
     def close(self) -> None:
@@ -305,7 +353,7 @@ class KillSwitch:
             esc_down = bool(user32.GetAsyncKeyState(0x1B) & 0x8000)
             if esc_down and not esc_was_down and self.esc_enabled and not self.active and self._in_control():
                 if own_esc_age() > 0.12:  # not the bridge's own injected Esc
-                    self.trip("esc")
+                    self.esc_pressed()
             esc_was_down = esc_down
         for i in ids:
             user32.UnregisterHotKey(None, i)
