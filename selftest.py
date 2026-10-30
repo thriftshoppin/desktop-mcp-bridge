@@ -371,6 +371,9 @@ async def t_password(c: Client):
 
 
 async def t_kill_combos(c: Client):
+    pid, w = await launch_form(c, "button", 1250, 500)
+    if w:
+        await c.call("desktop_window_focus", hwnd=w["hwnd"])  # the combos are sent to the foreground window, which must not be the bridge's own
     for combo in ("ctrl+alt+pause", "ctrl+alt+shift+k"):
         name = f"T10 kill switch {combo}: halts a running wait, refuses next call until desktop_resume"
         task = asyncio.create_task(c.call("desktop_wait", seconds=30))
@@ -390,6 +393,7 @@ async def t_kill_combos(c: Client):
         after = await c.call("desktop_monitors_list")
         ok = err_code(res) == "KILL_SWITCH" and err_code(nxt) == "KILL_SWITCH" and st["kill_switch"]["active"] and res_.get("was_active") and after.get("ok")
         record(name, bool(ok), f"halted in {halt_ms:.0f} ms ({err_code(res)}); next call -> {err_code(nxt)}; source={st['kill_switch']['source']!r}; after resume ok={after.get('ok')}")
+    await kill_pid(c, pid)
 
 
 async def t_fs(c: Client):

@@ -458,11 +458,13 @@ class Bridge:
     def _glide_patiently(self, px: int, py: int, cc: dict, guard) -> float:
         """Glide to the target. If the user grabs the mouse, wait (up to control.yield_wait_s) until it has been still for 0.5 s, then glide again from where it is."""
         wait_max = float(cc.get("yield_wait_s", 6))
+        detail = ""
         for attempt in range(4):
             try:
                 return winapi.glide(px, py, int(cc.get("glide_ms_min", 120)), int(cc.get("glide_ms_max", 300)), guard)
-            except winapi.UserMoved:
-                self.say("you moved the mouse: waiting for you to finish, then continuing", "yel")
+            except winapi.UserMoved as um:
+                detail = str(um)
+                self.say(f"you moved the mouse ({detail}): waiting for you to finish, then continuing", "yel")
                 end = time.monotonic() + wait_max
                 still_since, last = time.monotonic(), winapi.cursor_pos()
                 while time.monotonic() < end:
@@ -474,8 +476,8 @@ class Bridge:
                     elif time.monotonic() - still_since >= 0.5:
                         break
                 else:
-                    raise ToolRefused("USER_INTERVENTION", "Stopped: the user kept using the mouse for " + str(round(wait_max)) + " s. Nothing was clicked. Ask the user before retrying.")
-        raise ToolRefused("USER_INTERVENTION", "Stopped: the user kept moving the mouse. Nothing was clicked.")
+                    raise ToolRefused("USER_INTERVENTION", "Stopped: the user kept using the mouse for " + str(round(wait_max)) + " s. Nothing was clicked. Ask the user before retrying.", {"last_detail": detail})
+        raise ToolRefused("USER_INTERVENTION", "Stopped: the user kept moving the mouse. Nothing was clicked.", {"last_detail": detail})
 
     def _pointer_click(self, px: int, py: int, button: str = "left", count: int = 1, modifiers: list[str] | None = None) -> dict:
         """The real mouse: eased glide to the point, halo on the overlay, then a real click. Never an invoke pattern."""
