@@ -486,7 +486,7 @@ def main() -> None:
     ap.add_argument("--guardian", action="store_true", help="(default mode) shared guardian: one elevated worker serving every client")
     ap.add_argument("--instance", default="main", help="instance name (tests use their own so they never touch the user's guardian)")
     ap.add_argument("--idle-exit-s", type=float, default=0, help="test hook: exit this many seconds after the last client left (default: config guardian.idle_exit_min)")
-    ap.add_argument("--approval-dir", default=None, help="test hook: state folder (config approval + client allow-list); default %ProgramData%\\DesktopBridge\\state")
+    ap.add_argument("--approval-dir", default=None, help="test hook: state folder (config approval + client allow-list); default is the DesktopBridge state folder under ProgramData")
     ap.add_argument("--force-overlay-fail", action="store_true", help="test hook: make overlay creation fail (can only make the bridge MORE restrictive)")
     args = ap.parse_args()
     mcp_patch.apply()
