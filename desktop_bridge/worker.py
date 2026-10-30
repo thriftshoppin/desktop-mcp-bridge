@@ -399,6 +399,7 @@ def main() -> None:
     ap.add_argument("--pipe")
     ap.add_argument("--token")
     ap.add_argument("--launcher-pid", type=int)
+    ap.add_argument("--approval-dir", default=None, help="test hook: config-approval store directory (default: the desktop-bridge folder under LOCALAPPDATA)")
     ap.add_argument("--force-overlay-fail", action="store_true", help="test hook: make overlay creation fail (can only make the bridge MORE restrictive)")
     ap.add_argument("--handoff", action="store_true", help="read pipe/token/pid from the per-user handoff file (scheduled-task start)")
     args = ap.parse_args()
@@ -489,7 +490,7 @@ def main() -> None:
 
             threading.Thread(target=run_it, name="resume-prompt", daemon=True).start()
 
-    appr = policy.Approval(config_mod.ROOT)
+    appr = policy.Approval(config_mod.ROOT, args.approval_dir)
     ok_cfg, diff_lines, digest = appr.state()
     if ok_cfg:
         B.approved.set()

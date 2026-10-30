@@ -42,14 +42,17 @@ def start_worker(pipe: str, token: str):
     """Returns a process handle (int) or None. Raises RuntimeError when no way to start the elevated worker works."""
     # VISIBLE by design: python.exe (console), shown in a normal window with the live action feed; never pythonw / SW_HIDE.
     pythonw = sys.executable
-    params = f"-m desktop_bridge.worker --pipe {pipe} --token {token} --launcher-pid {SELF_PID}"
+    plist = ["-m", "desktop_bridge.worker", "--pipe", pipe, "--token", token, "--launcher-pid", str(SELF_PID)]
     if os.environ.get("DESKTOP_BRIDGE_FORCE_OVERLAY_FAIL"):  # test hook; can only make the worker more restrictive
-        params += " --force-overlay-fail"
+        plist.append("--force-overlay-fail")
+    if os.environ.get("DESKTOP_BRIDGE_APPROVAL_DIR"):  # test hook: use a different config-approval store (the real store stays untouched)
+        plist += ["--approval-dir", os.environ["DESKTOP_BRIDGE_APPROVAL_DIR"]]
+    params = subprocess.list2cmdline(plist)
     if is_admin():  # already elevated (e.g. started from an admin shell): no need for runas
         si = subprocess.STARTUPINFO()
         si.dwFlags = 1  # STARTF_USESHOWWINDOW
         si.wShowWindow = 4  # SW_SHOWNOACTIVATE
-        subprocess.Popen([pythonw] + params.split(), cwd=ROOT, creationflags=0x10, startupinfo=si)  # CREATE_NEW_CONSOLE
+        subprocess.Popen([pythonw] + plist, cwd=ROOT, creationflags=0x10, startupinfo=si)  # CREATE_NEW_CONSOLE
         return None
     sei = SHELLEXECUTEINFOW()
     sei.cbSize = ctypes.sizeof(sei)

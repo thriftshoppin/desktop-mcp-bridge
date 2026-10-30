@@ -192,9 +192,10 @@ class Bridge:
             "monitors": len(mons),
             "in_control": bool(self.control and self.control.in_control()),
             "idle_grace_s": self.control.grace if self.control else None,
+            "border_lead_ms_last": self.control.last_lead_ms if self.control else None,
             "overlay": {"ok": bool(self.overlay and self.overlay.ok), "visible": bool(self.overlay and self.overlay.visible),
                         "excluded_from_capture": bool(self.overlay and self.overlay.exclude and self.overlay.affinity_ok),
-                        "error": (self.overlay.error if self.overlay else "not created")},
+                        "error": (self.overlay.error if self.overlay else "not created"), "state": getattr(self.overlay, "_state", None)},
             "feed_window": self.feed_window_state(),
             "config_approved": self.approved.is_set(),
             "children": self.children_audit(),
@@ -525,7 +526,7 @@ class Bridge:
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             self.ks.check()
-            time.sleep(min(0.05, max(0.0, end - time.monotonic())))
+            time.sleep(min(0.02, max(0.0, end - time.monotonic())))
         return {"ok": True, "waited_s": seconds}
 
     # ------------------------------------------------------------------ apps / clipboard
@@ -555,13 +556,15 @@ class Bridge:
                 pass
         new: list[int] = []
         end = time.monotonic() + max(0, wait_ms) / 1000
+        last_change = time.monotonic()
         while time.monotonic() < end:
             self.ks.check()
             cur = [w for w in winapi.list_top_windows() if w not in before]
-            if cur:
-                new = cur
-                if pid is None or any(winapi.window_pid(w) == pid for w in cur):
-                    break
+            if set(cur) != set(new):
+                new, last_change = cur, time.monotonic()
+            # done once windows of the new process exist and nothing new appeared for 0.7 s (slow apps open a console first, then the real window)
+            if new and (pid is None or any(winapi.window_pid(w) == pid for w in new)) and time.monotonic() - last_change >= 0.7:
+                break
             time.sleep(0.1)
         wins = []
         for w in new:

@@ -26,6 +26,7 @@ class Control:
         self._last = 0.0
         self._lock = threading.Lock()
         self._stop = False
+        self.last_lead_ms = 0.0
         threading.Thread(target=self._reaper, name="control-reaper", daemon=True).start()
 
     def in_control(self) -> bool:
@@ -55,6 +56,7 @@ class Control:
             wait = self.lead - (time.monotonic() - self.overlay.shown_at)
             if wait > 0:
                 time.sleep(wait)
+            self.last_lead_ms = round((time.monotonic() - self.overlay.shown_at) * 1000)
         except BaseException:
             self.end()
             raise
