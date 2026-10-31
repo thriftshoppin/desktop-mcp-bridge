@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import capture  # noqa: F401  (first on purpose)
 from . import config as config_mod
 from . import clients as clients_mod
+from . import ctlguard
 from . import control as control_mod
 from . import mcp_patch
 from . import policy, safety, tools, winapi
@@ -696,17 +697,16 @@ def main() -> None:
 
     pending: dict[int, int] = {}   # control-connection id -> client pid (waiting for the user's 'Allow?' answer)
     key_locks: dict[str, threading.Lock] = {}
-    pending_n = [0]
+    limiter = ctlguard.ConnLimiter(per_pid=4, total_unread=32)   # DB-2: a flood of silent connections cannot lock launchers out
+    CTL_READ_TIMEOUT_S = 5.0
 
-    def handle_control(h) -> None:
+    def handle_control(h, my_id: int, pid: int) -> None:
         import win32file
         import win32pipe
-        pending_n[0] += 1
-        my_id = pending_n[0]
         try:
-            pid = win32pipe.GetNamedPipeClientProcessId(h)
             pending[my_id] = pid
-            raw = win32file.ReadFile(h, 4096)[1]
+            raw = ctlguard.read_with_timeout(h, 4096, CTL_READ_TIMEOUT_S)   # DB-2: a client that connects and says nothing is dropped after 5 s
+            limiter.request_read(my_id)
             req = json.loads(raw.decode("utf-8", "replace").strip() or "{}")
             if req.get("op") != "connect" or int(req.get("pid", -1)) != pid:
                 reply = {"ok": False, "reason": "bad request (the claimed pid must equal the pipe client's pid)"}
@@ -739,6 +739,7 @@ def main() -> None:
                 pass
         finally:
             pending.pop(my_id, None)
+            limiter.release(my_id)
             try:
                 win32file.FlushFileBuffers(h)
                 win32pipe.DisconnectNamedPipe(h)
@@ -751,23 +752,50 @@ def main() -> None:
                 pass
 
     def control_loop() -> None:
+        import win32api as _w
         import win32pipe
         first = True
+        last_note = 0.0
         while True:
-            h = _create_ctl_pipe(ctl_name, first)
+            try:
+                h = _create_ctl_pipe(ctl_name, first)
+            except Exception as e:
+                if first:   # DB-1: another program already owns the control pipe name (a squatter): do NOT carry on without a control pipe
+                    msg = (f"CONTROL PIPE UNAVAILABLE: could not create the first instance of the control pipe '{ctl_name}' ({type(e).__name__}: {e}). "
+                           "Another program may be squatting that name. The bridge stops; close the other program and start it again.")
+                    feed.put(msg, "red")
+                    log.log(msg)
+                    shutdown("control pipe could not be created (squatted?)", 3)
+                    return
+                time.sleep(0.2)   # later instances: pipe instances exhausted for the moment; try again
+                continue
             first = False
             try:
                 win32pipe.ConnectNamedPipe(h, None)
             except Exception as e:
                 if getattr(e, "winerror", None) != 535:  # ERROR_PIPE_CONNECTED: the client was already there, fine
                     try:
-                        import win32api as _w
                         _w.CloseHandle(h)
                     except Exception:
                         pass
                     time.sleep(0.2)
                     continue
-            threading.Thread(target=handle_control, args=(h,), name="control", daemon=True).start()
+            try:
+                pid = win32pipe.GetNamedPipeClientProcessId(h)
+            except Exception:
+                pid = -1
+            cid = limiter.admit(pid)
+            if cid is None:   # DB-2: too many open control connections from this process / in total: close at once
+                try:
+                    win32pipe.DisconnectNamedPipe(h)
+                    _w.CloseHandle(h)
+                except Exception:
+                    pass
+                if time.monotonic() - last_note > 5:
+                    last_note = time.monotonic()
+                    feed.put(f"control pipe: too many open connections (pid {pid}); extra connections are closed", "yel")
+                continue
+            threading.Thread(target=handle_control, args=(h, cid, pid), name="control", daemon=True).start()
 
     idle_s = args.idle_exit_s or float(cfg.get("guardian", {}).get("idle_exit_min", 120)) * 60
 

@@ -11,6 +11,7 @@ When the client closes our stdin the session ends; the guardian keeps running fo
 import ctypes
 import ctypes.wintypes as wt
 import json
+import msvcrt
 import os
 import subprocess
 import sys
@@ -35,6 +36,97 @@ class SHELLEXECUTEINFOW(ctypes.Structure):
                 ("lpParameters", wt.LPCWSTR), ("lpDirectory", wt.LPCWSTR), ("nShow", ctypes.c_int), ("hInstApp", wt.HINSTANCE),
                 ("lpIDList", ctypes.c_void_p), ("lpClass", wt.LPCWSTR), ("hkeyClass", wt.HKEY), ("dwHotKey", wt.DWORD),
                 ("hIcon", wt.HANDLE), ("hProcess", wt.HANDLE)]
+
+
+class UntrustedGuardian(RuntimeError):
+    """The program that answers on the control pipe is not our guardian (DB-1). Never retried, never started over."""
+
+
+HIGH_INTEGRITY = 0x3000
+
+
+def _norm(p: str) -> str:
+    return os.path.normcase(os.path.abspath(p)) if p else ""
+
+
+def expected_images() -> set:
+    """Images the real guardian can run as: the interpreter that started this launcher (the venv python.exe is a shim that starts the base interpreter)."""
+    return {_norm(sys.executable), _norm(getattr(sys, "_base_executable", "") or sys.executable)}
+
+
+def server_pid_of(f) -> int:
+    pid = wt.DWORD(0)
+    k32.GetNamedPipeServerProcessId.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+    if not k32.GetNamedPipeServerProcessId(msvcrt.get_osfhandle(f.fileno()), ctypes.byref(pid)):
+        raise OSError(ctypes.get_last_error(), "GetNamedPipeServerProcessId failed")
+    return pid.value
+
+
+def process_image(pid: int) -> str:
+    k32.OpenProcess.restype = wt.HANDLE
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        n = wt.DWORD(1024)
+        return buf.value if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) else ""
+    finally:
+        k32.CloseHandle(h)
+
+
+def process_integrity(pid: int):
+    """Integrity RID of a process (0x2000 medium, 0x3000 high), or None when it cannot be read."""
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32.OpenProcess.restype = wt.HANDLE
+    h = k32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return None
+    tok = wt.HANDLE()
+    try:
+        if not adv.OpenProcessToken(h, 0x8, ctypes.byref(tok)):  # TOKEN_QUERY
+            return None
+        sz = wt.DWORD(0)
+        adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(sz))  # TokenIntegrityLevel
+        buf = ctypes.create_string_buffer(sz.value)
+        if not adv.GetTokenInformation(tok, 25, buf, sz, ctypes.byref(sz)):
+            return None
+        adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wt.DWORD]
+        adv.GetSidSubAuthority.restype = ctypes.POINTER(wt.DWORD)
+        sid = ctypes.c_void_p.from_buffer(buf).value
+        count = adv.GetSidSubAuthorityCount(sid)[0]
+        return int(adv.GetSidSubAuthority(sid, count - 1)[0])
+    finally:
+        if tok.value:
+            k32.CloseHandle(tok)
+        k32.CloseHandle(h)
+
+
+def check_guardian(image: str, integrity, allowed: set):
+    """-> None if the pipe server may be our guardian, else the reason. Pure function (unit-tested)."""
+    if not image:
+        return "its program could not be identified"
+    if _norm(image) not in allowed:
+        return f"it runs {image}, not this bridge's Python interpreter"
+    if integrity is None:
+        return "its integrity level could not be read"
+    if integrity < HIGH_INTEGRITY:
+        return f"it is not elevated (integrity {integrity:#x}); the real guardian always runs at High integrity"
+    return None
+
+
+def verify_guardian(f) -> None:
+    """DB-1: the control pipe name is predictable, so before sending anything check WHO owns the other end. Raises UntrustedGuardian."""
+    try:
+        pid = server_pid_of(f)
+        why = check_guardian(process_image(pid), process_integrity(pid), expected_images())
+    except Exception as e:
+        pid, why = 0, f"the check itself failed ({type(e).__name__}: {e})"
+    if why:
+        raise UntrustedGuardian(f"refusing to talk to the program that owns the control pipe (pid {pid}): {why}. "
+                                "It may be an impostor squatting the pipe name; nothing was sent to it.")
 
 
 def is_admin() -> bool:
@@ -88,13 +180,19 @@ def start_guardian():
 def try_open_control():
     """-> an open pipe, None if no guardian is running, or False if it is running but momentarily busy (retry; never start a second guardian)."""
     try:
-        return open(control_path(), "r+b", buffering=0)
+        f = open(control_path(), "r+b", buffering=0)
     except FileNotFoundError:
         return None
     except OSError as e:
         if getattr(e, "winerror", 0) == 231 or e.errno == 22:  # ERROR_PIPE_BUSY: the guardian is between two pipe instances
             return False
         return None
+    try:
+        verify_guardian(f)   # DB-1: authenticate the other end before anything is sent
+    except BaseException:
+        f.close()
+        raise
+    return f
 
 
 def open_existing(deadline: float):
