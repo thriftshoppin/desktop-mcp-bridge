@@ -66,9 +66,11 @@ class Squatter:
             pass
 
     def close(self):
+        import ctypes
         import win32api
         self.stop = True
         try:
+            ctypes.windll.kernel32.CancelIoEx(ctypes.c_void_p(int(self.h)), None)   # a thread may be blocked in ConnectNamedPipe/ReadFile on this handle: cancel first, or CloseHandle hangs
             win32api.CloseHandle(self.h)
         except Exception:
             pass
@@ -160,11 +162,17 @@ def live() -> None:
     # ---- SEC-2: flood of silent connections (DB-2)
     t0 = time.monotonic()
     conns = []
+    import win32pipe
     for _ in range(80):
-        try:
-            conns.append(win32file.CreateFile(path, 0xC0000000, 0, None, 3, 0, None))
-        except Exception:
-            break
+        for _try in range(40):   # the guardian offers one free instance at a time: wait (up to 2 s) for the next one when it is momentarily busy
+            try:
+                conns.append(win32file.CreateFile(path, 0xC0000000, 0, None, 3, 0, None))
+                break
+            except Exception:
+                try:
+                    win32pipe.WaitNamedPipe(path, 50)
+                except Exception:
+                    time.sleep(0.05)
     opened = len(conns)
     closed_fast = 0
     time.sleep(0.5)
@@ -191,7 +199,7 @@ def live() -> None:
     th.join(15)
     served = b'"result"' in out.get("l", b"")
     record("SEC-2a while 80 silent connections are held open a legitimate launcher is still served", served, f"flood connections opened={opened}, launcher served={served} after {time.monotonic() - t0:.1f}s")
-    record("SEC-2b the per-process cap closes the excess connections at once (at most 4 of the 80 stay open)", opened - closed_fast <= 4 + 1, f"closed immediately={closed_fast} of {opened}, still open={opened - closed_fast}")
+    record("SEC-2b the per-process cap closes the excess connections at once (at most 4 of the 80 stay open)", opened >= 60 and opened - closed_fast <= 4 + 1, f"closed immediately={closed_fast} of {opened}, still open={opened - closed_fast}")
     time.sleep(6)   # past the 5 s read timeout
     still = 0
     for c in conns:
@@ -231,11 +239,18 @@ def live() -> None:
         pin = launcher.open_pipe(r"\\.\pipe" + "\\" + sess["pipe"] + "-in", "wb", time.monotonic() + 10)
         pout = launcher.open_pipe(r"\\.\pipe" + "\\" + sess["pipe"] + "-out", "rb", time.monotonic() + 10)
         pin.write(b"HELLO " + b"0" * 48 + b"\n")
-        try:
-            got_ok = pout.read(3).strip() == b"OK"
-        except Exception:
-            got_ok = False
-        for f in (pin, pout):
+        box: dict = {}
+
+        def rd_ok():
+            try:
+                box["v"] = pout.read(3)
+            except Exception:
+                box["v"] = b""
+        th = threading.Thread(target=rd_ok, daemon=True)
+        th.start()
+        th.join(8)   # no 'OK' within 8 s (or an immediate close) = not served
+        got_ok = box.get("v", b"").strip() == b"OK"
+        for f in ((pin,) if th.is_alive() else (pin, pout)):   # never close a handle another thread is still blocked reading: that hangs
             try:
                 f.close()
             except Exception:
