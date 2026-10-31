@@ -3,6 +3,8 @@
 
 # Desktop MCP Bridge (working name)
 
+**Disclaimer.** Desktop MCP Bridge gives an AI agent control of your computer. It is experimental. It assumes the machine is not already compromised and cannot verify that. Use it at your own risk, on a machine you trust, and keep the kill switch (Esc) in reach.
+
 One local stdio MCP server that lets Claude use **this Windows PC** the way a person does: see the screen, read the UI tree,
 click, type, press shortcuts, open apps, move files, run commands, and check whether audio is playing. Personal tool, local only,
 no network listener, no push. Built for `C:\Users\SysAdmin` but paths live in `config.json`.
@@ -35,6 +37,21 @@ Claude desktop (Cowork) = PRIMARY client          Claude Code (VS Code) = option
   fails, the launcher falls back to the scheduled task `DesktopBridgeWorker` (create it once with `install-elevated-task.ps1`).
 * UAC on this PC is **enabled with silent elevation** (`ConsentPromptBehaviorAdmin=0`). The guardian is elevated, so input works in elevated windows and
   `desktop_run`/`desktop_launch` run elevated (the `elevated` parameters are kept for compatibility).
+
+## Threat model (short)
+
+**In scope** (the bridge tries to defend against these):
+1. A prompt-injected or misused Claude trying to exceed its permissions through the bridge's tools.
+2. A local program that races or squats the bridge's endpoints (the control pipe, the per-session pipes).
+3. A second agent client with a forged identity or header.
+4. Accidental leakage: the bridge has no network listener, downloads are gated, typed text is not logged by default, captures are temporary.
+
+**Out of scope** (accepted and documented): a host that is already compromised by malware running as the user or as an administrator. With silent UAC elevation any same-account code can become administrator, so the bridge cannot defend against it, and the maintainer cannot verify that a host is clean. Hardening that raises the cost for such malware is *defense in depth*, never a boundary.
+
+Details: [SECURITY.md](SECURITY.md) and [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md).
+
+## Documentation
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/OPERATIONS.md](docs/OPERATIONS.md) · [docs/TESTING.md](docs/TESTING.md) · [docs/TOOLS.md](docs/TOOLS.md) (generated) · [docs/features/](docs/features/) · [CHANGELOG.md](CHANGELOG.md)
 
 ## Install / register (you do this; the bridge never edits Claude's config)
 
@@ -144,7 +161,7 @@ paths - Recycle Bin deletes - temp files under `%TEMP%\desktop-bridge\` older th
 (tool, window/element/file, <= 120-char escaped excerpt), the log records it, and **`desktop_resume` refuses** (`INJECTION_LOCKOUT`). Only the user can resume, by typing `y` at "Resume? (y/N)" in the feed window. Weak matches are labelled and logged only.
 No setting, flag or parameter relaxes this. Text *inside images* cannot be scanned (no OCR in v1).
 
-**Config approval.** `config.json` (+ `config.local.json`) are hashed; the hash of the version you last approved is stored in `%LOCALAPPDATA%\desktop-bridge\config.approved.json`. If the config is new or changed, the feed window shows what changed and asks
+**Config approval.** `config.json` (+ `config.local.json`) are hashed; the hash of the version you last approved is stored in `%ProgramData%\DesktopBridge\state\config.approved.json`. If the config is new or changed, the feed window shows what changed and asks
 `Approve changed config? (y/N)`; **no tool works until you answer**. `config.json`, `SKILL.md`, `SECURITY.md` and the approval store are on the protected-paths list (`fs` refuses writes, `run` refuses non-read-only commands touching them).
 
 **Optional hard lock (do NOT let Claude run this; you run it yourself in an elevated PowerShell).** The worker runs as your account, elevated, so software checks can in theory be bypassed. An ACL makes accidental or casual edits impossible; it is not a boundary against an elevated process of the same account:

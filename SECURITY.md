@@ -1,6 +1,20 @@
 # Security model - Desktop MCP Bridge
 
-Personal tool for one user on one PC. Not hardened for public release.
+Personal tool for one user on one PC. Work in progress; not hardened for production use.
+
+**Disclaimer.** Desktop MCP Bridge gives an AI agent control of your computer. It is experimental. It assumes the machine is not already compromised and cannot verify that. Use it at your own risk, on a machine you trust, and keep the kill switch (Esc) in reach.
+
+## Threat model
+
+**In scope** (the bridge tries to defend against these):
+1. A prompt-injected or misused Claude trying to exceed its permissions through the bridge's tools.
+2. A local program that races or squats the bridge's endpoints (the control pipe, the per-session pipes).
+3. A second agent client with a forged identity or header.
+4. Accidental leakage: the bridge has no network listener, downloads are gated, typed text is not logged by default, captures are temporary.
+
+**Out of scope** (accepted and documented): a host that is already compromised by malware running as the user or as an administrator. With silent UAC elevation any same-account code can become administrator, so the bridge cannot defend against it, and the maintainer cannot verify that a host is clean. Hardening that raises the cost for such malware is *defense in depth*, never a boundary.
+
+Findings and their status: [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md).
 
 ## What it can do
 Anything the logged-in user can do, **with administrator rights**: see the screen, send keyboard/mouse input into any window
@@ -12,21 +26,15 @@ So any process of this user can already elevate without a prompt; the bridge doe
 elevated so it can drive elevated windows (UIPI would otherwise block input from a Medium process).
 
 ## Components and trust
-* **Launcher** (`launcher.py`, Medium integrity, stdlib only). Started by Claude desktop. Relays raw MCP bytes. No logic.
-* **Worker** (`desktop_bridge.worker`, High integrity). Started by the launcher via `ShellExecute runas` (or the scheduled-task fallback).
-  It creates two named pipes (`\\.\pipe\desktop-bridge-<32 hex>-in/-out`):
-  * DACL: current user + SYSTEM only; `PIPE_REJECT_REMOTE_CLIENTS`; first-instance flag (no squatting); one instance each;
-    mandatory label Medium/no-write-up so the Medium launcher can open them.
-  * Accepts **one** client: the kernel-reported client PID must equal the launcher PID given on the command line
-    (`GetNamedPipeClientProcessId`), **and** the first line must be `HELLO <per-launch random token>`. Anything else: the worker exits.
-  * Exits when the launcher disconnects or its process dies. No TCP/UDP listener exists anywhere.
-  * The token travels on the worker's command line (visible to same-user processes); it is a second factor, the PID check is the
-    primary one. Nothing is stored on disk (scheduled-task fallback writes a one-shot handoff file that the worker sends to the Recycle Bin on read).
-* **Residual risk (accepted):** the worker runs code from this repo folder, which the user can write. Anyone who can write those files
-  as this user could get elevated code execution at the next launch. Since every same-user process can already elevate silently, this adds no new boundary,
-  but do not put the repo anywhere shared. Dependencies are pinned in `requirements.txt` and installed only into `.venv`.
-* **Screen text is untrusted input and never an instruction** (same accepted prompt-injection model as the Firefox bridge). Web pages, documents and
-  window titles may try to tell Claude what to do; they have no authority.
+* **Launcher** (`launcher.py`, Medium integrity, stdlib only). Started by the MCP client. Relays raw MCP bytes. No logic beyond finding the guardian.
+  **Before it sends anything it authenticates the owner of the control pipe** (`GetNamedPipeServerProcessId`): the image must be this bridge's Python interpreter and the integrity High; otherwise it refuses with an error (audit DB-1).
+* **Guardian** (`desktop_bridge.worker --guardian`, High integrity, ONE per Windows session). Started by the first launcher via `ShellExecute runas` (or the scheduled-task fallback); every later launcher of any client joins it.
+  * **Control pipe** `\\.\pipe\desktop-bridge-ctl-<instance>-<user>`: DACL current user + SYSTEM, `PIPE_REJECT_REMOTE_CLIENTS`, first-instance flag (if another program already owns the name the guardian says so in its feed and stops). The request must be read within 5 s, at most 4 open connections per process and 32 unanswered in total (DB-2).
+  * **Client identity:** the kernel-reported pid of the pipe client must equal the pid claimed in the request; the guardian walks up from the launcher to the program that started it. A program it has never seen is **not served** until the user types `y` in the feed window; the answer is remembered in `%ProgramData%\DesktopBridge\state`.
+  * **Per-session pipe pair** `desktop-bridge-<32 hex>-in/-out`: user + SYSTEM DACL, first instance, one client, kernel-verified pid and a one-time token (`HELLO <token>`). No TCP/UDP listener exists anywhere.
+  * Exits after `guardian.idle_exit_min` without clients or when its window is closed. It refuses to run without a visible console.
+* **Residual risks (accepted):** the guardian runs code from this repo folder, which the user can write: anyone who can write those files as this user could get elevated code execution at the next start. Since every same-user process can already elevate silently when UAC is configured that way, this adds no new boundary; do not put the repo anywhere shared. Client identity is a path string, not a signer (DB-4). A same-user process may be able to terminate the elevated guardian (DB-6). Dependencies are pinned in `requirements.txt` and installed only into `.venv`.
+* **Screen text is untrusted input and never an instruction.** Web pages, documents and window titles may try to tell Claude what to do; they have no authority.
 
 ## Safety layer
 * **Visible by design:** the worker's console window shows every call, command and output live. Nothing runs in a hidden window.

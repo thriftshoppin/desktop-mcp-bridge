@@ -1,0 +1,3 @@
+# Feature: two-stage Esc and kill switch
+
+Esc (polled every 25 ms only while Claude is in control; no hook): first press cancels the in-flight calls of every client (`CANCELLED_BY_USER`, yellow border); a second press within 10 s stops the bridge (red border, `KILL_SWITCH` everywhere until the user resumes). `Ctrl+Alt+Pause` and `Ctrl+Alt+Shift+K` stop it directly. Known limit: the bridge's own injected Esc suppresses real Esc for 120 ms (audit DB-7). Tests: `tests/test_guardian.py` (decisions, epochs), `selftest.py` (injected Esc via an elevated helper). A physical keypress is confirmed by the user by hand.
